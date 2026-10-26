@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::prelude::PermissionsExt;
+use std::os::unix::prelude::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uucore::diagnostics::OptionValue;
 use uucore::display::Quotable;
@@ -617,6 +617,32 @@ fn create_standard_pass_sequence(num_passes: usize) -> Vec<PassType> {
     sequence
 }
 
+/// Regular files, plus block and character devices. Directories, FIFOs,
+/// and sockets are rejected.
+fn can_shred(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() || is_device(metadata)
+}
+
+#[cfg(unix)]
+fn is_device(metadata: &fs::Metadata) -> bool {
+    let file_type = metadata.file_type();
+    file_type.is_block_device() || file_type.is_char_device()
+}
+
+#[cfg(not(unix))]
+fn is_device(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// Size to overwrite. Block devices typically report 0 from `stat`, so
+/// fall back to seeking to the end of the open file descriptor.
+fn shred_size(file: &mut File, metadata: &fs::Metadata) -> u64 {
+    if metadata.len() != 0 || !is_device(metadata) {
+        return metadata.len();
+    }
+    file.seek(SeekFrom::End(0)).unwrap_or(0)
+}
+
 #[allow(clippy::cognitive_complexity)]
 fn wipe_file(
     path_str: &OsString,
@@ -692,7 +718,7 @@ fn wipe_file(
     // "no such file" error while a permission error falls through to the
     // open-for-writing below, which surfaces the real reason.
     match get_metadata() {
-        Ok(md) if !md.is_file() => {
+        Ok(md) if !can_shred(&md) => {
             return Err(USimpleError::new(
                 1,
                 translate_text!("shred-not-a-file", "file" => display_path.maybe_quote()),
@@ -729,9 +755,25 @@ fn wipe_file(
             .map_err_context(|| translate!("shred-failed-to-set-permissions"))?;
     }
 
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err_context(
+            || translate_text!("shred-failed-to-open-for-writing", "file" => display_path.maybe_quote()),
+        )?;
+
+    // `-x` / `--exact` is the default for non-regular files (device nodes).
+    let exact = exact || !metadata.is_file();
+
+    let size = match size {
+        Some(size) => size,
+        None => shred_size(&mut file, &metadata),
+    };
+
     // Fill up our pass sequence
     let mut pass_sequence = Vec::new();
-    if metadata.len() != 0 {
+    if size != 0 {
         // Only add passes if the file is non-empty
 
         if n_passes <= 3 {
@@ -755,18 +797,6 @@ fn wipe_file(
     }
 
     let total_passes = pass_sequence.len();
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err_context(
-            || translate_text!("shred-failed-to-open-for-writing", "file" => display_path.maybe_quote()),
-        )?;
-
-    let size = match size {
-        Some(size) => size,
-        None => metadata.len(),
-    };
 
     for (i, pass_type) in pass_sequence.into_iter().enumerate() {
         if verbose {
@@ -790,7 +820,7 @@ fn wipe_file(
             file.set_len(0).map_err_context(
                 || translate_text!("shred-failed-to-remove-file", "file" => display_path.maybe_quote()),
             )?;
-        } else {
+        } else if metadata.is_file() {
             do_remove(path, verbose, remove_method).map_err_context(
                 || translate_text!("shred-failed-to-remove-file", "file" => display_path.maybe_quote()),
             )?;

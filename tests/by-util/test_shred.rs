@@ -488,6 +488,23 @@ fn test_shred_trailing_slash_on_dir() {
 
 #[test]
 #[cfg(unix)]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths (/dev) not visible")]
+fn test_shred_writes_to_char_device() {
+    new_ucmd!()
+        .args(["-n1", "-s1", "-v", "/dev/null"])
+        .succeeds()
+        .stderr_contains("pass 1/1 (random)");
+}
+
+#[test]
+fn test_shred_rejects_directory() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir");
+    ucmd.arg("dir").fails().stderr_contains("Not a file");
+}
+
+#[test]
+#[cfg(unix)]
 fn test_shred_inaccessible_file_reports_real_error() {
     // A file whose parent directory lacks search permission must not be
     // misreported as "No such file or directory": `Path::exists()` and
