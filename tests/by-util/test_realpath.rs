@@ -2,7 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore nusr
+
 use uutests::new_ucmd;
 use uutests::path_concat;
 use uutests::util::{TestScenario, get_root_path};
@@ -15,6 +17,7 @@ use std::path::{MAIN_SEPARATOR, Path};
 static GIBBERISH: &str = "supercalifragilisticexpialidocious";
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_current_directory() {
     let (at, mut ucmd) = at_and_ucmd!();
     let expect = at.root_dir_resolved() + "\n";
@@ -22,6 +25,7 @@ fn test_realpath_current_directory() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_long_redirection_to_current_dir() {
     let (at, mut ucmd) = at_and_ucmd!();
     // Create a 256-character path to current directory
@@ -39,6 +43,7 @@ fn test_realpath_long_redirection_to_root() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: absolute symlink targets")]
 fn test_realpath_file_and_links() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
@@ -51,6 +56,7 @@ fn test_realpath_file_and_links() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: absolute symlink targets")]
 fn test_realpath_file_and_links_zero() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
@@ -128,6 +134,7 @@ fn test_realpath_file_and_links_strip_zero() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: absolute symlink targets")]
 fn test_realpath_physical_mode() {
     let scene = TestScenario::new(util_name!());
     let at = &scene.fixtures;
@@ -161,6 +168,7 @@ fn test_realpath_logical_mode() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_dangling() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.symlink_file("nonexistent-file", "link");
@@ -176,6 +184,7 @@ fn test_realpath_dangling() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: absolute symlink targets")]
 fn test_realpath_loop() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.symlink_file("2", "1");
@@ -187,6 +196,43 @@ fn test_realpath_loop() {
 }
 
 #[test]
+fn test_realpath_growing_loop() {
+    // `foo -> foo/bar` never repeats the same remaining path, so it must be
+    // stopped by the limit on followed symlinks rather than loop forever.
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.relative_symlink_file("foo/bar", "foo");
+    for args in [&[][..], &["-e"], &["-m"], &["-L"], &["-P"]] {
+        scene
+            .ucmd()
+            .args(args)
+            .arg("foo")
+            .fails_with_code(1)
+            .no_stdout()
+            .stderr_contains("Too many levels of symbolic links");
+    }
+}
+
+#[test]
+fn test_realpath_symlink_follow_limit() {
+    // Like the kernel, give up after following 40 symlinks.
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.touch("target");
+    at.relative_symlink_file("target", "link1");
+    for i in 2..=41 {
+        at.relative_symlink_file(&format!("link{}", i - 1), &format!("link{i}"));
+    }
+    let expect = path_concat!(at.root_dir_resolved(), "target") + "\n";
+    scene.ucmd().arg("link40").succeeds().stdout_only(expect);
+    scene
+        .ucmd()
+        .arg("link41")
+        .fails_with_code(1)
+        .stderr_contains("Too many levels of symbolic links");
+}
+
+#[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_default_allows_final_non_existent() {
     let p = Path::new("").join(GIBBERISH);
     let (at, mut ucmd) = at_and_ucmd!();
@@ -201,6 +247,7 @@ fn test_realpath_default_forbids_non_final_non_existent() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_existing() {
     let (at, mut ucmd) = at_and_ucmd!();
     ucmd.arg("-e")
@@ -215,6 +262,15 @@ fn test_realpath_existing_error() {
 }
 
 #[test]
+fn test_realpath_existing_error_quiet() {
+    new_ucmd!()
+        .args(&["-q", "-e", GIBBERISH])
+        .fails_with_code(1)
+        .no_output();
+}
+
+#[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_missing() {
     let p = Path::new("").join(GIBBERISH).join(GIBBERISH);
     let (at, mut ucmd) = at_and_ucmd!();
@@ -226,6 +282,7 @@ fn test_realpath_missing() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
 fn test_realpath_when_symlink_is_absolute_and_enoent() {
     let (at, mut ucmd) = at_and_ucmd!();
 
@@ -257,6 +314,7 @@ fn test_realpath_when_symlink_is_absolute_and_enoent() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: absolute symlink targets")]
 fn test_realpath_when_symlink_part_is_missing() {
     let (at, mut ucmd) = at_and_ucmd!();
 
@@ -511,6 +569,7 @@ fn test_realpath_empty() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_realpath_non_utf8_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;

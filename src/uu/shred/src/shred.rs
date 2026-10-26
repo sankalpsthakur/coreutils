@@ -14,15 +14,15 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::prelude::PermissionsExt;
+use std::os::unix::prelude::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uucore::diagnostics::OptionValue;
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult, USimpleError, UUsageError};
+use uucore::error::{FromIo, UResult, USimpleError, UUsageError, strip_errno};
 use uucore::parser::parse_size::parse_size_u64;
 use uucore::parser::shortcut_value_parser::ShortcutValueParser;
-use uucore::translate;
 use uucore::{format_usage, show_error, show_if_err};
+use uucore::{translate, translate_text};
 
 pub mod options {
     pub const FORCE: &str = "force";
@@ -94,6 +94,17 @@ enum Pattern {
 enum PassType {
     Pattern(Pattern),
     Random,
+}
+
+/// Settings shared by every file passed on the command line.
+struct WipeOptions {
+    n_passes: usize,
+    remove_method: RemoveMethod,
+    size: Option<u64>,
+    exact: bool,
+    zero: bool,
+    verbose: bool,
+    force: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -247,8 +258,11 @@ impl BytesWriter {
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // The command line is kept for the caret in size diagnostics, which needs
     // the size as typed.
-    let (matches, diag_args) =
-        uucore::clap_localization::handle_clap_result_with_diagnostics(uu_app(), args.collect())?;
+    let (matches, diag_args) = uucore::clap_localization::handle_clap_result_with_diagnostics(
+        uu_app(),
+        args.collect(),
+        1,
+    )?;
 
     if !matches.contains_id(options::FILE) {
         return Err(UUsageError::new(
@@ -295,22 +309,18 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         .get_one::<String>(options::SIZE)
         .map(ToOwned::to_owned);
     let size = get_size(size_arg, diag_args.as_deref())?;
-    let exact = matches.get_flag(options::EXACT) || size.is_some();
-    let zero = matches.get_flag(options::ZERO);
-    let verbose = matches.get_flag(options::VERBOSE);
+    let wipe_options = WipeOptions {
+        n_passes: iterations,
+        remove_method,
+        size,
+        exact: matches.get_flag(options::EXACT) || size.is_some(),
+        zero: matches.get_flag(options::ZERO),
+        verbose: matches.get_flag(options::VERBOSE),
+        force,
+    };
 
     for path_str in matches.get_many::<OsString>(options::FILE).unwrap() {
-        show_if_err!(wipe_file(
-            path_str,
-            iterations,
-            remove_method,
-            size,
-            exact,
-            zero,
-            random_source.as_ref(),
-            verbose,
-            force,
-        ));
+        show_if_err!(wipe_file(path_str, &wipe_options, random_source.as_ref()));
     }
     Ok(())
 }
@@ -607,36 +617,99 @@ fn create_standard_pass_sequence(num_passes: usize) -> Vec<PassType> {
     sequence
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Regular files, plus block and character devices. Directories, FIFOs,
+/// and sockets are rejected.
+fn can_shred(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() || is_device(metadata)
+}
+
+#[cfg(unix)]
+fn is_device(metadata: &fs::Metadata) -> bool {
+    let file_type = metadata.file_type();
+    file_type.is_block_device() || file_type.is_char_device()
+}
+
+#[cfg(not(unix))]
+fn is_device(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// Size to overwrite. Block devices typically report 0 from `stat`, so
+/// fall back to seeking to the end of the open file descriptor.
+fn shred_size(file: &mut File, metadata: &fs::Metadata) -> u64 {
+    if metadata.len() != 0 || !is_device(metadata) {
+        return metadata.len();
+    }
+    file.seek(SeekFrom::End(0)).unwrap_or(0)
+}
+
 #[allow(clippy::cognitive_complexity)]
 fn wipe_file(
     path_str: &OsString,
-    n_passes: usize,
-    remove_method: RemoveMethod,
-    size: Option<u64>,
-    exact: bool,
-    zero: bool,
+    wipe_options: &WipeOptions,
     random_source: Option<&RefCell<File>>,
-    verbose: bool,
-    force: bool,
 ) -> UResult<()> {
-    // Get these potential errors out of the way first
-    let path = Path::new(path_str);
+    let WipeOptions {
+        n_passes,
+        remove_method,
+        size,
+        exact,
+        zero,
+        verbose,
+        force,
+    } = *wipe_options;
+
+    let display_path = Path::new(path_str);
+
+    // Keep the command-line operand for diagnostics; use the resolved path
+    // only for filesystem operations.
+    let is_stdout = cfg!(unix) && path_str == "-";
+    let path = if is_stdout {
+        #[cfg(unix)]
+        {
+            Path::new("/dev/fd/1")
+        }
+        #[cfg(not(unix))]
+        {
+            display_path
+        }
+    } else {
+        display_path
+    };
 
     if path_str.as_encoded_bytes().ends_with(b"/") {
         if path.is_dir() {
             return Err(USimpleError::new(
                 1,
-                translate!("shred-failed-to-open-for-writing-is-a-directory", "file" => path.maybe_quote()),
+                translate_text!("shred-failed-to-open-for-writing-is-a-directory", "file" => display_path.maybe_quote()),
             ));
         }
         if fs::metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotADirectory) {
             return Err(USimpleError::new(
                 1,
-                translate!("shred-failed-to-open-for-writing-not-a-directory", "file" => path.maybe_quote()),
+                translate_text!("shred-failed-to-open-for-writing-not-a-directory", "file" => display_path.maybe_quote()),
             ));
         }
     }
+
+    // On OpenBSD, /dev/fd/1 is a character device rather than a symlink.
+    // Get the metadata from stdout's file descriptor to inspect the actual file.
+    #[cfg(target_os = "openbsd")]
+    let get_metadata = || {
+        if is_stdout {
+            use std::{io::stdout, os::fd::AsFd};
+
+            stdout()
+                .as_fd()
+                .try_clone_to_owned()
+                .and_then(|fd| File::from(fd).metadata())
+        } else {
+            fs::metadata(path)
+        }
+    };
+
+    #[cfg(not(target_os = "openbsd"))]
+    let get_metadata = || fs::metadata(path);
 
     // `Path::exists()` and `Path::is_file()` both collapse any metadata error
     // (including a permission error) into `false`, which made shred report a
@@ -644,27 +717,26 @@ fn wipe_file(
     // directory". Inspect the metadata directly so a genuine `ENOENT` stays a
     // "no such file" error while a permission error falls through to the
     // open-for-writing below, which surfaces the real reason.
-    match fs::metadata(path) {
-        Ok(md) if !md.is_file() => {
+    match get_metadata() {
+        Ok(md) if !can_shred(&md) => {
             return Err(USimpleError::new(
                 1,
-                translate!("shred-not-a-file", "file" => path.maybe_quote()),
+                translate_text!("shred-not-a-file", "file" => display_path.maybe_quote()),
             ));
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Err(USimpleError::new(
                 1,
-                translate!("shred-no-such-file-or-directory", "file" => path.maybe_quote()),
+                translate_text!("shred-no-such-file-or-directory", "file" => display_path.maybe_quote()),
             ));
         }
         _ => {}
     }
 
-    let metadata =
-        fs::metadata(path).map_err_context(|| translate!("shred-failed-to-get-metadata"))?;
+    let metadata = get_metadata().map_err_context(|| translate!("shred-failed-to-get-metadata"))?;
 
     // If force is true, set file permissions to not-readonly.
-    if force {
+    if force && !is_stdout {
         let mut perms = metadata.permissions();
         #[cfg(unix)]
         #[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
@@ -683,9 +755,25 @@ fn wipe_file(
             .map_err_context(|| translate!("shred-failed-to-set-permissions"))?;
     }
 
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err_context(
+            || translate_text!("shred-failed-to-open-for-writing", "file" => display_path.maybe_quote()),
+        )?;
+
+    // `-x` / `--exact` is the default for non-regular files (device nodes).
+    let exact = exact || !metadata.is_file();
+
+    let size = match size {
+        Some(size) => size,
+        None => shred_size(&mut file, &metadata),
+    };
+
     // Fill up our pass sequence
     let mut pass_sequence = Vec::new();
-    if metadata.len() != 0 {
+    if size != 0 {
         // Only add passes if the file is non-empty
 
         if n_passes <= 3 {
@@ -709,23 +797,11 @@ fn wipe_file(
     }
 
     let total_passes = pass_sequence.len();
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err_context(
-            || translate!("shred-failed-to-open-for-writing", "file" => path.maybe_quote()),
-        )?;
-
-    let size = match size {
-        Some(size) => size,
-        None => metadata.len(),
-    };
 
     for (i, pass_type) in pass_sequence.into_iter().enumerate() {
         if verbose {
             let pass_name = pass_name(&pass_type);
-            let msg = translate!("shred-pass-progress", "file" => path.maybe_quote());
+            let msg = translate_text!("shred-pass-progress", "file" => display_path.maybe_quote());
             show_error!(
                 "{msg} {}/{total_passes} ({pass_name})...",
                 (i + 1).to_string()
@@ -733,14 +809,22 @@ fn wipe_file(
         }
         // size is an optional argument for exactly how many bytes we want to shred
         do_pass(&mut file, &pass_type, exact, random_source, size).map_err_context(
-            || translate!("shred-file-write-pass-failed", "file" => path.maybe_quote()),
+            || translate_text!("shred-file-write-pass-failed", "file" => display_path.maybe_quote()),
         )?;
     }
 
     if remove_method != RemoveMethod::None {
-        do_remove(path, verbose, remove_method).map_err_context(
-            || translate!("shred-failed-to-remove-file", "file" => path.maybe_quote()),
-        )?;
+        if is_stdout {
+            // Deallocate stdout's data for -u/--remove without renaming or
+            // unlinking the file that the descriptor refers to.
+            file.set_len(0).map_err_context(
+                || translate_text!("shred-failed-to-remove-file", "file" => display_path.maybe_quote()),
+            )?;
+        } else if metadata.is_file() {
+            do_remove(path, verbose, remove_method).map_err_context(
+                || translate_text!("shred-failed-to-remove-file", "file" => display_path.maybe_quote()),
+            )?;
+        }
     }
     Ok(())
 }
@@ -831,7 +915,7 @@ fn wipe_name(orig_path: &Path, verbose: bool, remove_method: RemoveMethod) -> Pa
                     break;
                 }
                 Err(e) => {
-                    let msg = translate!("shred-couldnt-rename", "file" => last_path.maybe_quote(), "new_name" => new_path.quote(), "error" => e);
+                    let msg = translate_text!("shred-couldnt-rename", "file" => last_path.maybe_quote(), "new_name" => new_path.quote(), "error" => strip_errno(&e));
                     show_error!("{msg}");
                     // TODO: replace with our error management
                     std::process::exit(1);
@@ -847,7 +931,7 @@ fn do_remove(path: &Path, verbose: bool, remove_method: RemoveMethod) -> Result<
     if verbose {
         show_error!(
             "{}",
-            translate!("shred-removing", "file" => path.maybe_quote())
+            translate_text!("shred-removing", "file" => path.maybe_quote())
         );
     }
 
@@ -862,7 +946,7 @@ fn do_remove(path: &Path, verbose: bool, remove_method: RemoveMethod) -> Result<
     if verbose {
         show_error!(
             "{}",
-            translate!("shred-removed", "file" => path.maybe_quote())
+            translate_text!("shred-removed", "file" => path.maybe_quote())
         );
     }
 

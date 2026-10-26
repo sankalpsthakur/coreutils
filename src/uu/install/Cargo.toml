@@ -14,23 +14,23 @@ readme.workspace = true
 [lib]
 path = "src/install.rs"
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 clap = { workspace = true }
-file_diff = { workspace = true }
+fluent = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
 thiserror = { workspace = true }
 uucore = { workspace = true, default-features = true, features = [
   "backup-control",
   "buf-copy",
+  "entries",
   "fs",
   "mode",
   "perms",
-  "entries",
   "process",
 ] }
-fluent = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 selinux = { workspace = true, optional = true }
 
 [features]
@@ -43,3 +43,4 @@ workspace = true
 [[bin]]
 name = "install"
 path = "src/main.rs"
+required-features = ["uucore/default"]

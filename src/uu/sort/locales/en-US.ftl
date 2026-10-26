@@ -12,8 +12,10 @@ sort-after-help = The key format is FIELD[.CHAR][OPTIONS][,FIELD[.CHAR]][OPTIONS
 
 # Error messages
 sort-open-failed = open failed: {$path}: {$error}
+sort-truncate-failed = failed to truncate: {$path}: {$error}
 sort-parse-key-error = failed to parse key {$key}: {$msg}
 sort-cannot-read = cannot read: {$path}: {$error}
+sort-read-failed = read failed: {$error}
 sort-open-tmp-file-failed = failed to open temporary file: {$error}
 sort-compress-prog-execution-failed = could not run compress program '{$prog}': {$error}
 sort-compress-prog-terminated-abnormally = {$prog} terminated abnormally
@@ -22,6 +24,7 @@ sort-file-operands-combined = extra operand {$file}
     file operands cannot be combined with --files0-from
     Try '{$help} --help' for more information.
 sort-multiple-output-files = multiple output files specified
+sort-incompatible-tabs = incompatible tabs
 sort-minus-in-stdin = when reading file names from standard input, no file name of '-' allowed
 sort-no-input-from = no input from {$file}
 sort-random-source-end-of-file = {$path}: end of file
@@ -56,6 +59,7 @@ sort-failed-fetch-rlimit = Failed to fetch rlimit
 sort-invalid-suffix-in-option-arg = invalid suffix in --{$option} argument {$arg}
 sort-invalid-option-arg = invalid --{$option} argument {$arg}
 sort-option-arg-too-large = --{$option} argument {$arg} too large
+sort-parallel-must-be-nonzero = number in parallel must be nonzero
 sort-error-disorder = {$file}:{$line_number}: disorder: {$line}
 sort-error-buffer-size-too-big = Buffer size {$size} does not fit in address space
 sort-error-no-match-for-key = ^ no match for key

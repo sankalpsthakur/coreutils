@@ -3,12 +3,32 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
+// spell-checker:ignore tvos watchos visionos
+
+use cfg_aliases::cfg_aliases;
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+    cfg_aliases! {
+        // Directory open flags that grant search but not read access.
+        // tests/by-util/test_install.rs repeats the union of these targets.
+        has_o_path: { any(target_os = "linux", target_os = "android") },
+        has_o_search: { any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        ) },
+    }
+
     let out_dir = env::var("OUT_DIR")?;
 
     let mut embedded_file = File::create(Path::new(&out_dir).join("embedded_locales.rs"))?;
@@ -22,7 +42,7 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(embedded_file)?;
 
     // Generate optimized lookup function instead of HashMap
-    writeln!(embedded_file, "#[expect(clippy::match_same_arms)]")?; // needed for dir and vdir aliases for ls
+    writeln!(embedded_file, "#[allow(clippy::match_same_arms)]")?; // needed for dir and vdir aliases for ls
     writeln!(
         embedded_file,
         "pub fn get_embedded_locale(key: &str) -> Option<&'static str> {{"
@@ -260,6 +280,15 @@ fn embed_static_utility_locales(
         return Ok(()); // nothing to scan
     };
 
+    // Which utilities we embed here depends on the crates unpacked next to us
+    // in the registry, i.e. on what the consumer depends on. Cargo only knows
+    // about the files we declare, so without watching the consumer's lock file
+    // a utility added after the first build would keep printing raw message
+    // ids until uucore is rebuilt by hand.
+    if let Some(lock_file) = consumer_lock_file(env::var_os("OUT_DIR").as_deref()) {
+        println!("cargo:rerun-if-changed={}", lock_file.display());
+    }
+
     // First, try to embed uucore locales - critical for common translations like "Usage:"
     embed_component_locales(embedded_file, locales_to_embed, "uucore", |locale| {
         Path::new(&manifest_dir).join(format!("locales/{locale}.ftl"))
@@ -289,6 +318,19 @@ fn embed_static_utility_locales(
     }
 
     Ok(())
+}
+
+/// Find the `Cargo.lock` of the project we are being built for, by walking up
+/// from `OUT_DIR` (`<target>/<profile>/build/uucore-<hash>/out`) until a lock
+/// file shows up next to a target directory.
+///
+/// Returns `None` when there is none to watch, e.g. for a build with a target
+/// directory outside of the project.
+fn consumer_lock_file(out_dir: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    Path::new(out_dir?)
+        .ancestors()
+        .map(|dir| dir.join("Cargo.lock"))
+        .find(|lock| lock.is_file())
 }
 
 /// Determines which locales to embed into the binary.
@@ -350,11 +392,12 @@ fn embed_locale_file(
             embedded_file,
             "        // Locale for {component} ({locale})"
         )?;
-        // Determine if we need a hash. If content contains ", we need r#""#
-        let delimiter = if content.contains('"') { "#" } else { "" };
+        // Never a raw string: `r#"..."#` ends at `"#`, so content holding that
+        // pair closes the literal and the rest is compiled as Rust. `{:?}`
+        // escapes every quote and has no terminator the content can reach.
         writeln!(
             embedded_file,
-            "        \"{locale_key}\" => Some(r{delimiter}\"{content}\"{delimiter}),"
+            "        {locale_key:?} => Some({content:?}),"
         )?;
 
         // Tell Cargo to rerun if this file changes
@@ -436,6 +479,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_lock_file_found_above_target_dir() {
+        let tmp = std::env::temp_dir().join(format!("uucore-build-{}", std::process::id()));
+        let out_dir = tmp.join("target/debug/build/uucore-1234/out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        assert_eq!(consumer_lock_file(Some(out_dir.as_os_str())), None);
+
+        let lock = tmp.join("Cargo.lock");
+        std::fs::write(&lock, "").unwrap();
+        assert_eq!(consumer_lock_file(Some(out_dir.as_os_str())), Some(lock));
+
+        assert_eq!(consumer_lock_file(None), None);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn get_locales_to_embed_no_lang() {

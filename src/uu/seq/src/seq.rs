@@ -2,7 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore (ToDO) bigdecimal extendedbigdecimal numberparse hexadecimalfloat biguint
+
 use std::ffi::{OsStr, OsString};
 use std::io::{BufWriter, Write, stdout};
 
@@ -29,7 +31,7 @@ mod numberparse;
 use crate::error::SeqError;
 use crate::number::PreciseNumber;
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "fuchsia")))]
 use uucore::signals;
 use uucore::translate;
 
@@ -173,12 +175,13 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
 
         let padding = if options.equal_width {
             let precision_value = precision.unwrap_or(0);
+            // The increment is never printed, so only its fractional digits
+            // (through `precision`) matter, not its integral ones.
             // Saturate rather than overflow: a value with an astronomically large
             // exponent makes `num_integral_digits` near `usize::MAX`. The resulting
             // width is rejected later by the formatter's width check.
             first
                 .num_integral_digits
-                .max(increment.num_integral_digits)
                 .max(last.num_integral_digits)
                 .saturating_add(if precision_value > 0 {
                     precision_value.saturating_add(1)
@@ -228,7 +231,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
             // unless SIGPIPE was explicitly ignored, in which case it should fail.
             let err = err.map_err_context(|| "write error".into());
             uucore::show_error!("{err}");
-            #[cfg(unix)]
+            #[cfg(all(unix, not(target_os = "fuchsia")))]
             if signals::sigpipe_was_ignored() {
                 uucore::error::set_exit_code(1);
             }

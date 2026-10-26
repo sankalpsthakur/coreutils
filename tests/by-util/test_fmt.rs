@@ -4,6 +4,7 @@
 // file that was distributed with this source code.
 
 // spell-checker:ignore plass samp FFFD
+
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use uutests::new_ucmd;
@@ -65,7 +66,7 @@ fn test_fmt_width_max_display_width() {
         .stdout_is("aa\nbb cc\ndd ee\n");
 }
 
-/// Regression for https://github.com/uutils/coreutils/issues/10095
+/// Regression for <https://github.com/uutils/coreutils/issues/10095>
 ///
 /// GNU `fmt` measures `-w` in UTF-8 bytes (not Unicode display columns).
 /// These cases match GNU coreutils 9.11.
@@ -149,6 +150,33 @@ fn test_fmt_positional_width_not_first() {
         .args(&["one-word-per-line.txt", "-10"])
         .fails_with_code(1)
         .stderr_contains("fmt: invalid option -- 1; -WIDTH is recognized only when it is the first\noption; use -w N instead");
+}
+
+#[test]
+fn test_fmt_negative_number_file_after_double_dash() {
+    use uutests::util::TestScenario;
+    use uutests::util_name;
+
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.write("-9", "hidden text\n");
+    scene.fixtures.write("f", "the quick brown fox jumps\n");
+    for args in [&["--", "-9", "f"][..], &["-u", "--", "-9", "f"]] {
+        scene
+            .ucmd()
+            .args(args)
+            .succeeds()
+            .stdout_only("hidden text\nthe quick brown fox jumps\n");
+    }
+    scene
+        .ucmd()
+        .args(&["f", "--", "-9"])
+        .succeeds()
+        .stdout_only("the quick brown fox jumps\nhidden text\n");
+    scene
+        .ucmd()
+        .args(&["--", "-9"])
+        .succeeds()
+        .stdout_only("hidden text\n");
 }
 
 #[test]
@@ -303,7 +331,8 @@ fn prefix_minus() {
 #[test]
 fn prefix_equal() {
     for prefix_args in [
-        // FIXME: #6353 vec!["-p="],
+        vec!["-p="],
+        vec!["-up="],
         vec!["-p", "="],
         vec!["--prefix=="],
         vec!["--prefix", "="],
@@ -311,6 +340,7 @@ fn prefix_equal() {
         vec!["--pref", "="],
         // Test self-overriding:
         vec!["--prefix=-", "--prefix=="],
+        vec!["-p-", "-p="],
     ] {
         new_ucmd!()
             .args(&prefix_args)
@@ -323,7 +353,8 @@ fn prefix_equal() {
 #[test]
 fn prefix_equal_skip_prefix_equal_two() {
     for prefix_args in [
-        // FIXME: #6353 vec!["--prefix==", "-P=2"],
+        vec!["--prefix==", "-P=2"],
+        vec!["-p=", "-uP=2"],
         vec!["--prefix==", "-P", "=2"],
         vec!["--prefix==", "--skip-prefix==2"],
         vec!["--prefix==", "--skip-prefix", "=2"],
@@ -331,12 +362,92 @@ fn prefix_equal_skip_prefix_equal_two() {
         vec!["--prefix==", "--skip-pref", "=2"],
         // Test self-overriding:
         vec!["--prefix==", "--skip-pref", "asdf", "-P", "=2"],
+        vec!["-p=", "-Pignored", "-P=2"],
     ] {
         new_ucmd!()
             .args(&prefix_args)
             .arg("prefixed-one-word-per-line.txt")
             .succeeds()
             .stdout_is_fixture("prefixed-one-word-per-line_p=_P=2.txt");
+    }
+}
+
+#[test]
+fn prefix_with_multiple_equals() {
+    for prefix_args in [vec!["-p=="], vec!["-up=="], vec!["--prefix==="]] {
+        new_ucmd!()
+            .args(&prefix_args)
+            .pipe_in("=unchanged\n==one\n==two\n")
+            .succeeds()
+            .stdout_only("=unchanged\n==one two\n");
+    }
+}
+
+#[test]
+fn prefix_containing_short_option_spelling() {
+    for prefix_args in [vec!["-p-p="], vec!["--prefix=-p="], vec!["-qp-p="]] {
+        new_ucmd!()
+            .args(&prefix_args)
+            .pipe_in("-p=one\n-p=two\n")
+            .succeeds()
+            .stdout_only("-p=one two\n");
+    }
+}
+
+#[test]
+fn prefix_option_spelling_after_terminator_is_a_file() {
+    let (at, mut cmd) = uutests::at_and_ucmd!();
+    at.write("-p=", "one\ntwo\n");
+    cmd.args(&["--", "-p="]).succeeds().stdout_only("one two\n");
+}
+
+#[test]
+fn prefix_ignores_leading_whitespace_without_exact_prefix() {
+    for prefix_args in [vec!["-p", "> "], vec!["--prefix", "> "]] {
+        new_ucmd!()
+            .args(&prefix_args)
+            .pipe_in("  > alpha\n  > beta\n")
+            .succeeds()
+            .stdout_only("  > alpha beta\n");
+    }
+}
+
+#[test]
+fn exact_prefix_requires_the_prefix_to_start_the_line() {
+    for prefix_args in [
+        vec!["-x", "-p", "> "],
+        vec!["--exact-prefix", "--prefix", "> "],
+    ] {
+        new_ucmd!()
+            .args(&prefix_args)
+            .pipe_in("  > alpha\n  > beta\n")
+            .succeeds()
+            .stdout_only("  > alpha\n  > beta\n");
+    }
+}
+
+#[test]
+fn skip_prefix_ignores_leading_whitespace_without_exact_skip_prefix() {
+    for prefix_args in [vec!["-P", "#"], vec!["--skip-prefix", "#"]] {
+        new_ucmd!()
+            .args(&prefix_args)
+            .pipe_in("  # note\n  # more\n")
+            .succeeds()
+            .stdout_only("  # note\n  # more\n");
+    }
+}
+
+#[test]
+fn exact_skip_prefix_requires_the_prefix_to_start_the_line() {
+    for prefix_args in [
+        vec!["-X", "-P", "#"],
+        vec!["--exact-skip-prefix", "--skip-prefix", "#"],
+    ] {
+        new_ucmd!()
+            .args(&prefix_args)
+            .pipe_in("  # note\n  # more\n")
+            .succeeds()
+            .stdout_only("  # note # more\n");
     }
 }
 
@@ -414,6 +525,7 @@ fn test_fmt_knuth_plass_line_breaking() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_fmt_non_utf8_paths() {
     use uutests::at_and_ucmd;
 
@@ -454,4 +566,85 @@ fn test_fmt_width_multiplication_overflow() {
         .args(&["-w", "267672676527678256"])
         .fails_with_code(1)
         .stderr_is("fmt: invalid width: '267672676527678256'\n");
+}
+
+#[test]
+fn test_fmt_goal_only_defaults_width_to_goal_plus_ten() {
+    // GNU defaults the width to goal + 10 when only --goal is given, so `-g G`
+    // has to lay a paragraph out exactly as `-w G+10 -g G` does.
+    for goal in [5, 10, 20, 30, 50, 65] {
+        let widened = new_ucmd!()
+            .args(&[
+                "one-word-per-line.txt",
+                "-w",
+                &(goal + 10).to_string(),
+                "-g",
+                &goal.to_string(),
+            ])
+            .succeeds()
+            .stdout_move_str();
+
+        new_ucmd!()
+            .args(&["one-word-per-line.txt", "-g", &goal.to_string()])
+            .succeeds()
+            .stdout_is(&widened);
+    }
+
+    // The whole 37-column paragraph therefore fits on one line at goal 30.
+    new_ucmd!()
+        .args(&["one-word-per-line.txt", "--goal", "30"])
+        .succeeds()
+        .stdout_is("this is a file with one word per line\n");
+}
+
+#[test]
+fn test_fmt_prefix_copies_unprefixed_last_line_without_adding_newline() {
+    for (input, expected) in [
+        ("x", "x"),
+        ("  x", "  x"),
+        ("a\nmixed", "a\nmixed"),
+        // a line with the prefix is reformatted and gets its newline
+        ("# hi", "# hi\n"),
+        ("x\n# hi", "x\n# hi\n"),
+        ("x\n#", "x\n#\n"),
+    ] {
+        for args in [vec!["-p", "#"], vec!["-s", "-p", "#"]] {
+            new_ucmd!()
+                .args(&args)
+                .pipe_in(input)
+                .succeeds()
+                .stdout_only(expected);
+        }
+    }
+}
+
+#[test]
+fn test_fmt_prefix_unprefixed_last_line_runs_into_next_file() {
+    use uutests::at_and_ucmd;
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("f1", "a\nmixed");
+    at.write("f2", "hello\n");
+    ucmd.args(&["-p", "#", "f1", "f2"])
+        .succeeds()
+        .stdout_only("a\nmixedhello\n");
+}
+
+#[test]
+fn test_fmt_anti_prefix_keeps_missing_final_newline() {
+    for (args, input, expected) in [
+        (vec!["-P", "#"], "a\n#x", "a\n#x"),
+        (vec!["-P", "#"], "a\n#x\n", "a\n#x\n"),
+        (vec!["-P", "#"], "#x\na\n", "#x\na\n"),
+        (vec!["--skip-prefix", "#"], "a\n  #x", "a\n  #x"),
+        (vec!["-p", ">", "-P", ">#"], "> a\n>#x", "> a\n>#x"),
+        // a line that is reformatted gets its newline
+        (vec!["-P", "#"], "a\nb", "a b\n"),
+    ] {
+        new_ucmd!()
+            .args(&args)
+            .pipe_in(input)
+            .succeeds()
+            .stdout_only(expected);
+    }
 }

@@ -3,6 +3,8 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
+// spell-checker:ignore étage replacen
+
 //! Render an error against the argument list it came from.
 //!
 //! Utilities whose arguments *are* the expression they evaluate — `test`, `expr`
@@ -19,7 +21,8 @@
 //!
 //! Rendering only happens when stderr is a terminal, so anything reading our
 //! output — a script, a pipe, a test suite — still sees the plain one-line
-//! message it always did.
+//! message it always did. `UUTILS_DIAG=always` or `never` overrides that
+//! check.
 //!
 //! ```text
 //! tr: range-endpoints of 'y-b' are in reverse collating sequence order
@@ -33,19 +36,50 @@
 //! ───╯
 //! ```
 
-// spell-checker:ignore étage replacen
-
 use std::borrow::Cow;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use ariadne::{CharSet, Color, Config, IndexType, Label, Report, ReportKind, Source};
 
 use crate::display::Quotable;
 use crate::translate;
+
+/// The variable that overrides the terminal check.
+const MODE_VAR: &str = "UUTILS_DIAG";
+
+/// When to render an error against its argument list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    /// Let stderr decide.
+    Auto,
+    Always,
+    Never,
+}
+
+impl Mode {
+    /// What [`MODE_VAR`] asks for.
+    ///
+    /// Anything but `always` and `never` is [`Mode::Auto`] rather than an
+    /// error — this gets exported from shell profiles, and no spelling of it
+    /// should make a utility fail.
+    fn from_env(value: Option<&OsStr>) -> Self {
+        let Some(value) = value.and_then(OsStr::to_str) else {
+            return Self::Auto;
+        };
+        if value.eq_ignore_ascii_case("always") {
+            Self::Always
+        } else if value.eq_ignore_ascii_case("never") {
+            Self::Never
+        } else {
+            Self::Auto
+        }
+    }
+}
 
 /// Whether errors should be rendered against their argument list.
 ///
@@ -54,11 +88,23 @@ use crate::translate;
 ///
 /// # Returns
 ///
-/// `true` when stderr is a terminal — a person is watching, and gets the rich
-/// form. `false` in a script or a pipe, where whatever reads stderr gets the
-/// plain message it can grep for.
+/// What `UUTILS_DIAG` asks for, when it asks. Otherwise `true` when stderr is
+/// a terminal — a person is watching, and gets the rich form — and `false` in
+/// a script or a pipe, where whatever reads stderr gets the plain message it
+/// can grep for.
 pub fn enabled() -> bool {
-    std::io::stderr().is_terminal()
+    // Decided once: a utility may ask for every location it records.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match Mode::from_env(env::var_os(MODE_VAR).as_deref()) {
+        Mode::Always => true,
+        Mode::Never => false,
+        Mode::Auto => std::io::stderr().is_terminal(),
+    })
+}
+
+/// Whether a drawn report is colored: at a terminal, unless `NO_COLOR` is set.
+pub fn use_color() -> bool {
+    env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
 }
 
 /// Keep the arguments a diagnostic would point at, as they were typed.
@@ -94,7 +140,7 @@ pub fn operands(args: &[OsString]) -> Option<Vec<OsString>> {
 }
 
 pub use crate::features::diagnostics_boundary::{
-    OptionValue, char_span, floor_boundary, list_items,
+    OptionValue, ValueOptions, char_span, floor_boundary, list_items,
 };
 
 /// The error to raise for something a caret may have just explained.
@@ -177,7 +223,7 @@ impl Snapshot {
         let mut snapshot = Self::with_capacity(args.len());
         for arg in args {
             snapshot.push(match crate::os_str_from_bytes(arg.as_ref()) {
-                Ok(arg) => arg.into_owned(),
+                Ok(arg) => arg.to_owned(),
                 // Only reachable on platforms where `OsStr` is not raw bytes;
                 // show the argument lossily rather than not at all.
                 Err(_) => String::from_utf8_lossy(arg.as_ref()).into_owned().into(),
@@ -350,16 +396,55 @@ impl Snapshot {
     ///
     /// The index of that positional, or `None` if there are not that many.
     pub fn index_of_positional(&self, n: usize) -> Option<usize> {
+        self.index_of_operand(n, &ValueOptions::NONE)
+    }
+
+    /// Index of the `n`-th operand, stepping over the values of `options`.
+    ///
+    /// As [`Snapshot::index_of_positional`], but for a utility whose options
+    /// take a separate value: `csplit -n 3 file 5` has two operands, not
+    /// three, and naming `-n` is what keeps the caret off the `3`.
+    ///
+    /// # Arguments
+    ///
+    /// * `n` - Zero-based rank among the operands.
+    /// * `options` - The options whose value is a separate argument.
+    ///
+    /// # Returns
+    ///
+    /// The index of that operand, or `None` if there are not that many.
+    pub fn index_of_operand(&self, n: usize, options: &ValueOptions) -> Option<usize> {
         let mut options_ended = false;
-        let mut positionals = (self.first_operand..self.args.len()).filter(|&index| {
-            let bytes = self.args[index].as_encoded_bytes();
-            if !options_ended && bytes == b"--" {
-                options_ended = true;
-                return false;
+        let mut skip_value = false;
+        let mut rank = 0;
+
+        for (index, arg) in self.args.iter().enumerate().skip(self.first_operand) {
+            if skip_value {
+                skip_value = false;
+                continue;
             }
-            options_ended || !bytes.starts_with(b"-") || bytes == b"-"
-        });
-        positionals.nth(n)
+            if !options_ended {
+                let bytes = arg.as_encoded_bytes();
+                if bytes == b"--" {
+                    options_ended = true;
+                    continue;
+                }
+                // A lone `-` is an operand, and so is an argument that is not
+                // UTF-8, which no option spelling can be.
+                if let Some(text) = arg.to_str()
+                    && text.starts_with('-')
+                    && text != "-"
+                {
+                    skip_value = options.takes_next(text);
+                    continue;
+                }
+            }
+            if rank == n {
+                return Some(index);
+            }
+            rank += 1;
+        }
+        None
     }
 
     /// Byte range of the argument at `index`.
@@ -590,7 +675,8 @@ impl Snapshot {
     /// * `has_help` - Whether an advice line was asked for at all.
     fn localize_help(body: &str, has_help: bool) -> Cow<'_, str> {
         let localized = translate!("diagnostics-help-label");
-        if !has_help || localized == "Help" {
+        // Without a localizer, the lookup hands back the id.
+        if !has_help || localized == "Help" || localized == "diagnostics-help-label" {
             return Cow::Borrowed(body);
         }
         let mut lines: Vec<Cow<'_, str>> = body.lines().map(Cow::Borrowed).collect();
@@ -633,13 +719,13 @@ impl Snapshot {
     /// `None` when ariadne could not render, in which case the caller falls
     /// back to the plain one-line message.
     fn render_body(
-        &self,
+        id: &str,
+        text: &str,
         span: Range<usize>,
         label: Option<&str>,
         help: Option<&str>,
         color: bool,
     ) -> Option<String> {
-        let id = crate::util_name();
         let config = Config::default()
             // ariadne counts characters unless told otherwise, which would drift
             // on multi-byte arguments.
@@ -663,7 +749,7 @@ impl Snapshot {
         let mut rendered = Vec::new();
         if report
             .finish()
-            .write((id, Source::from(self.text.as_str())), &mut rendered)
+            .write((id, Source::from(text)), &mut rendered)
             .is_err()
         {
             return None;
@@ -689,14 +775,26 @@ impl Snapshot {
         help: Option<&str>,
     ) -> bool {
         let id = crate::util_name();
-        let color = env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal();
-        let Some(body) = self.render_body(span, label, help, color) else {
+        let Some(body) = Self::draw(id, &self.text, span, label, help, use_color()) else {
             return false;
         };
+        eprint!("{id}: {message}\n{body}");
+        true
+    }
+
+    /// The finished report for `span` in `text`, ending with a newline.
+    fn draw(
+        id: &str,
+        text: &str,
+        span: Range<usize>,
+        label: Option<&str>,
+        help: Option<&str>,
+        color: bool,
+    ) -> Option<String> {
+        let body = Self::render_body(id, text, span, label, help, color)?;
         let body = Self::localize_help(&body, help.is_some());
-        let body = body.as_ref();
         if label.is_some() {
-            eprint!("{id}: {message}\n{body}");
+            Some(body.into_owned())
         } else {
             // The empty message left an arrow arm pointing at nothing: drop it
             // and flatten the tee, so only the underline remains. Only the two
@@ -709,16 +807,113 @@ impl Snapshot {
                 .filter(|&(row, line)| !(Self::is_label_row(row) && line.contains('╰')))
                 .map(|(row, line)| {
                     if Self::is_label_row(row) {
-                        Cow::Owned(line.replace('┬', "─"))
+                        Cow::Owned(line.replace('┬', "─").trim_end().to_string())
                     } else {
                         Cow::Borrowed(line)
                     }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            eprintln!("{id}: {message}\n{body}");
+            Some(body + "\n")
         }
-        true
+    }
+}
+
+/// One line of a script or a pattern file, for a report to point into, as
+/// [`Snapshot`] does into the arguments.
+pub struct SourceLine<'a> {
+    name: &'a str,
+    line_number: usize,
+    text: &'a str,
+}
+
+impl<'a> SourceLine<'a> {
+    /// Line `line_number` (1-based) of the text called `name`.
+    pub fn new(name: &'a str, line_number: usize, text: &'a str) -> Self {
+        Self {
+            name,
+            line_number,
+            text,
+        }
+    }
+
+    /// The report pointing at the byte range `span` of the line, headed by
+    /// `name:line:column` with a byte column, without the message line.
+    /// An empty span marks one character, or the place just past the end.
+    pub fn report(
+        &self,
+        span: Range<usize>,
+        label: Option<&str>,
+        help: Option<&str>,
+    ) -> Option<String> {
+        self.report_colored(span, label, help, use_color())
+    }
+
+    fn report_colored(
+        &self,
+        span: Range<usize>,
+        label: Option<&str>,
+        help: Option<&str>,
+        color: bool,
+    ) -> Option<String> {
+        if self.line_number == 0 {
+            return None;
+        }
+        // The trailing space gives a caret past the end something to sit
+        // under; ariadne panics on a span past the text otherwise.
+        let text = format!("{} ", self.text);
+        let start = floor_boundary(self.text, span.start.min(self.text.len()));
+        let end = floor_boundary(self.text, span.end.clamp(start, self.text.len()));
+        let span = if start < end {
+            start..end
+        } else {
+            char_span(&text, start)
+        };
+        let body = Snapshot::draw(self.name, &text, span, label, help, color)?;
+        self.renumber(&body, start)
+    }
+
+    /// `body`, drawn as line 1, moved to the line's own number.
+    ///
+    /// ariadne applies a display offset to the header but not to the gutter,
+    /// so the gutter is widened here instead. Only the margin is touched, and
+    /// it holds no text of ours; the colors sit around its characters, so the
+    /// marks below are found whether or not the report is colored.
+    fn renumber(&self, body: &str, start: usize) -> Option<String> {
+        /// Row holding the line itself, below the header and a blank gutter.
+        const SOURCE: usize = 2;
+        let number = self.line_number.to_string();
+        let widen = number.len() - 1;
+        let rows: Vec<&str> = body.lines().collect();
+        let last = rows.len().checked_sub(1)?;
+        let mut out = String::with_capacity(body.len() + rows.len() * widen);
+        for (row, line) in rows.iter().enumerate() {
+            if row == 0 {
+                // ariadne counts the header's column in characters, not bytes.
+                let drawn = format!(" {}:1:", self.name);
+                let from = line.find(&drawn)? + 1;
+                let to = from + line[from..].find(' ')?;
+                let location = format!("{}:{number}:{}", self.name, start + 1);
+                let _ = write!(
+                    out,
+                    "{}{}{location}{}",
+                    " ".repeat(widen),
+                    &line[..from],
+                    &line[to..]
+                );
+            } else if row == SOURCE {
+                out.push_str(&line.replacen("1 │", &format!("{number} │"), 1));
+            } else if row == last {
+                out.push_str(&line.replacen('╯', &format!("{}╯", "─".repeat(widen)), 1));
+            } else {
+                out.push_str(&" ".repeat(widen));
+                out.push_str(line);
+            }
+            if row != last {
+                out.push('\n');
+            }
+        }
+        Some(out)
     }
 }
 
@@ -730,6 +925,23 @@ mod tests {
         Snapshot::new(args)
     }
 
+    /// Everything but `always` and `never` leaves the terminal check in
+    /// charge, rather than failing.
+    #[test]
+    fn the_mode_variable_decides_only_when_it_is_spelled_out() {
+        let mode = |value| Mode::from_env(Some(OsStr::new(value)));
+
+        assert_eq!(mode("always"), Mode::Always);
+        assert_eq!(mode("ALWAYS"), Mode::Always);
+        assert_eq!(mode("never"), Mode::Never);
+        assert_eq!(mode("Never"), Mode::Never);
+
+        for undecided in ["auto", "", "yes", "1", "sometimes"] {
+            assert_eq!(mode(undecided), Mode::Auto, "{undecided:?}");
+        }
+        assert_eq!(Mode::from_env(None), Mode::Auto);
+    }
+
     /// `localize_help` and `is_label_row` both address ariadne's output by row
     /// number, which only they know is right. Render a report whose shape is
     /// known and check it, so that an ariadne that adds or drops a row fails
@@ -737,9 +949,15 @@ mod tests {
     #[test]
     fn the_rendered_report_has_the_row_shape_the_rewriting_assumes() {
         let snap = snapshot(&["-k", "1,0"]);
-        let body = snap
-            .render_body(3..6, Some("a label"), Some("some advice"), false)
-            .unwrap();
+        let body = Snapshot::render_body(
+            "sort",
+            &snap.text,
+            3..6,
+            Some("a label"),
+            Some("some advice"),
+            false,
+        )
+        .unwrap();
         let rows: Vec<&str> = body.lines().collect();
 
         // Row 2 echoes the arguments; rewriting it would edit what was typed.
@@ -760,6 +978,74 @@ mod tests {
             rows.iter().skip(5).any(|row| row.contains("Help")),
             "no help row below row 4: {rows:?}"
         );
+    }
+
+    #[test]
+    fn a_source_line_keeps_its_number_and_counts_its_column_in_bytes() {
+        // `ü` is two bytes; the caret sits past the end of the line.
+        let report = SourceLine::new("f.sed", 12, "ü/b")
+            .report_colored(4..4, None, None, false)
+            .unwrap();
+        assert_eq!(
+            report,
+            concat!(
+                "    ╭─[ f.sed:12:5 ]\n",
+                "    │\n",
+                " 12 │ ü/b\n",
+                "    │    ─\n",
+                "────╯",
+            )
+        );
+    }
+
+    #[test]
+    fn a_colored_source_line_still_gets_its_location() {
+        let report = SourceLine::new("f.sed", 12, "x/y")
+            .report_colored(1..2, Some("here"), None, true)
+            .unwrap();
+        assert!(report.contains(" f.sed:12:2 "), "{report:?}");
+        assert!(report.contains("12 │"), "{report:?}");
+        assert!(!report.contains(":1:"), "{report:?}");
+    }
+
+    #[test]
+    fn an_empty_source_line_marks_its_first_column() {
+        let report = SourceLine::new("pats", 3, "")
+            .report_colored(0..0, None, None, false)
+            .unwrap();
+        assert_eq!(
+            report,
+            concat!(
+                "   ╭─[ pats:3:1 ]\n",
+                "   │\n",
+                " 3 │ \n",
+                "   │ ─\n",
+                "───╯",
+            )
+        );
+    }
+
+    #[test]
+    fn a_far_source_line_is_drawn_alone() {
+        let report = SourceLine::new("big", 4_000_321, "q")
+            .report_colored(0..1, None, Some("hint"), false)
+            .unwrap();
+        assert!(report.len() < 200, "{report:?}");
+        let rows: Vec<&str> = report.lines().collect();
+        assert_eq!(rows[0], "         ╭─[ big:4000321:1 ]");
+        assert_eq!(rows[2], " 4000321 │ q");
+        assert_eq!(*rows.last().unwrap(), "─────────╯");
+        // Every row keeps its gutter bar in the same column.
+        for row in &rows[1..rows.len() - 1] {
+            assert_eq!(row.chars().nth(9), Some('│'), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn advice_keeps_its_label_without_a_localizer() {
+        // Unit tests set up no localizer.
+        let body = Snapshot::render_body("t", "abc", 1..2, Some("x"), Some("y"), false).unwrap();
+        assert_eq!(Snapshot::localize_help(&body, true), body);
     }
 
     #[test]
@@ -964,6 +1250,64 @@ mod tests {
     fn a_lone_dash_is_a_positional() {
         let snap = snapshot(&["-c", "-", "x"]);
         assert_eq!(snap.index_of_positional(0), Some(1));
+    }
+
+    /// A utility with one option of each spelling that takes a value.
+    const VALUE_OPTIONS: ValueOptions = ValueOptions {
+        shorts: &['d'],
+        longs: &["suffix", "delimiter"],
+    };
+
+    #[test]
+    fn an_operand_is_found_past_a_detached_option_value() {
+        // Counting positionals would stop at the `q` given to `--suffix`.
+        let snap = Snapshot::with_program(&["numfmt", "--suffix", "q", "1000"]);
+        assert_eq!(snap.index_of_operand(0, &VALUE_OPTIONS), Some(3));
+        assert_eq!(snap.index_of_operand(1, &VALUE_OPTIONS), None);
+        assert_eq!(snap.index_of_positional(0), Some(2));
+    }
+
+    #[test]
+    fn an_attached_value_does_not_swallow_the_operand() {
+        for args in [
+            &["numfmt", "--suffix=q", "1000"][..],
+            &["numfmt", "-dq", "1000"][..],
+        ] {
+            let snap = Snapshot::with_program(args);
+            assert_eq!(
+                snap.index_of_operand(0, &VALUE_OPTIONS),
+                Some(2),
+                "in {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_abbreviated_long_option_still_takes_its_value() {
+        let snap = Snapshot::with_program(&["numfmt", "--suf", "q", "1000"]);
+        assert_eq!(snap.index_of_operand(0, &VALUE_OPTIONS), Some(3));
+    }
+
+    #[test]
+    fn only_the_last_of_a_short_cluster_takes_the_next_argument() {
+        // `-zd` ends in the value option, `-dz` does not.
+        let snap = Snapshot::with_program(&["numfmt", "-zd", ",", "1000"]);
+        assert_eq!(snap.index_of_operand(0, &VALUE_OPTIONS), Some(3));
+        let snap = Snapshot::with_program(&["numfmt", "-dz", "1000"]);
+        assert_eq!(snap.index_of_operand(0, &VALUE_OPTIONS), Some(2));
+    }
+
+    #[test]
+    fn an_option_value_past_a_double_dash_is_an_operand() {
+        let snap = Snapshot::with_program(&["numfmt", "--", "--suffix", "q"]);
+        assert_eq!(snap.index_of_operand(0, &VALUE_OPTIONS), Some(2));
+        assert_eq!(snap.index_of_operand(1, &VALUE_OPTIONS), Some(3));
+    }
+
+    #[test]
+    fn an_option_the_table_does_not_name_takes_nothing() {
+        let snap = Snapshot::with_program(&["numfmt", "--round", "up", "1000"]);
+        assert_eq!(snap.index_of_operand(0, &VALUE_OPTIONS), Some(2));
     }
 
     #[test]

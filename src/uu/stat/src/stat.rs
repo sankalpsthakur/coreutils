@@ -2,13 +2,14 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore datetime
 
 use std::ops::Range;
 use uucore::diagnostics::OptionValue;
 use uucore::error::{UError, UResult, USimpleError};
-use uucore::i18n::UEncoding;
-use uucore::quoting_style::{QuotingStyle as UucoreQuotingStyle, escape_name};
+use uucore::i18n::get_ctype_encoding;
+use uucore::quoting_style::{QuotingStyle, escape_name, quoting_style_from_env};
 use uucore::translate;
 
 use clap::builder::ValueParser;
@@ -33,24 +34,19 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-use thiserror::Error;
 use uucore::time::{FormatSystemTimeFallback, format_system_time, system_time_to_sec};
 
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 enum StatError {
-    #[error("{}", translate!("stat-error-invalid-quoting-style", "style" => style.clone()))]
-    InvalidQuotingStyle { style: String },
-    #[error("{}", translate!("stat-error-missing-operand"))]
-    MissingOperand,
-    #[error("{}", translate!("stat-error-invalid-directive", "directive" => directive.clone()))]
+    #[error("{}", translate!("stat-error-invalid-directive", "directive" => directive))]
     InvalidDirective { directive: String },
-    #[error("{}", translate!("stat-error-cannot-read-filesystem", "error" => error.clone()))]
+    #[error("{}", translate!("stat-error-cannot-read-filesystem", "error" => error))]
     CannotReadFilesystem { error: String },
     #[error("{}", translate!("stat-error-stdin-filesystem-mode"))]
     StdinFilesystemMode,
-    #[error("{}", translate!("stat-error-cannot-read-filesystem-info", "file" => file.clone(), "error" => error.clone()))]
+    #[error("{}", translate!("stat-error-cannot-read-filesystem-info", "file" => file, "error" => error))]
     CannotReadFilesystemInfo { file: String, error: String },
-    #[error("{}", translate!("stat-error-cannot-statx", "file" => file.clone(), "error" => error.clone()))]
+    #[error("{}", translate!("stat-error-cannot-statx", "file" => file, "error" => error))]
     CannotStatx { file: String, error: String },
 }
 
@@ -79,6 +75,7 @@ struct Flags {
     group: bool,
     major: bool,
     minor: bool,
+    quote: bool,
 }
 
 /// checks if the string is within the specified bound,
@@ -141,6 +138,8 @@ impl DirectiveError {
     /// * `option` - The format as typed and the option it was given to, or
     ///   `None` for a format stat built itself, which is not on the command
     ///   line and has nothing to point at.
+    #[cold]
+    #[inline(never)]
     fn to_error(
         &self,
         diag_args: Option<&[OsString]>,
@@ -203,7 +202,7 @@ fn write_padded_bytes<W: Write>(
     precision: Precision,
 ) -> io::Result<()> {
     let display_bytes = match precision {
-        Precision::Number(p) if p < bytes.len() => &bytes[..p],
+        Precision::Number(p) => bytes.get(..p).unwrap_or(bytes),
         _ => bytes,
     };
 
@@ -247,31 +246,6 @@ pub enum OutputType<'a> {
     UnsignedOct(u32),
     Timestamp(i64, u32),
     Unknown,
-}
-
-#[derive(Default)]
-enum QuotingStyle {
-    Locale,
-    Shell,
-    #[default]
-    ShellEscapeAlways,
-    Quote,
-}
-
-impl std::str::FromStr for QuotingStyle {
-    type Err = StatError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "locale" => Ok(Self::Locale),
-            "shell" => Ok(Self::Shell),
-            "shell-escape-always" => Ok(Self::ShellEscapeAlways),
-            // The others aren't exposed to the user
-            _ => Err(StatError::InvalidQuotingStyle {
-                style: s.to_string(),
-            }),
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -386,6 +360,8 @@ struct Stater {
     files: Vec<OsString>,
     mount_list: OnceCell<Option<Vec<OsString>>>,
     mount_list_needed: bool,
+    /// The quoting style of `%N` and `%Qn`, read on first use.
+    quoting_style: OnceCell<QuotingStyle>,
     default_tokens: Vec<Token>,
     default_dev_tokens: Vec<Token>,
     /// A bad directive, raised once the tokens before it are printed.
@@ -523,59 +499,23 @@ fn print_os_str(s: &OsString, flags: Flags, width: usize, precision: Precision) 
     }
 }
 
-fn quote_file_name(file_name: &str, quoting_style: &QuotingStyle) -> String {
-    match quoting_style {
-        QuotingStyle::Locale | QuotingStyle::Shell => {
-            let escaped = file_name.replace('\'', r"\'");
-            format!("'{escaped}'")
-        }
-        QuotingStyle::ShellEscapeAlways => escape_name(
-            OsStr::new(file_name),
-            UucoreQuotingStyle::Shell {
-                escape: true,
-                always_quote: true,
-                show_control: true,
-            },
-            UEncoding::Utf8,
-        )
+fn quote_file_name(file_name: &OsStr, quoting_style: QuotingStyle) -> String {
+    escape_name(file_name, quoting_style, get_ctype_encoding())
         .to_string_lossy()
-        .to_string(),
-        QuotingStyle::Quote => file_name.to_string(),
-    }
-}
-
-fn warn_invalid_quoting_style(style: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        show_error!(
-            "{}",
-            translate!("stat-warning-invalid-env-quoting-style", "style" => style.to_string())
-        );
-    }
+        .to_string()
 }
 
 fn get_quoted_file_name(
     display_name: &str,
     file: &OsString,
     file_type: FileType,
-    from_user: bool,
+    quoting_style: QuotingStyle,
 ) -> Result<String, i32> {
-    let quoting_style = match env::var("QUOTING_STYLE") {
-        Ok(style) => style.parse().unwrap_or_else(|_| {
-            // Match GNU coreutils 9.11: warn (once) when QUOTING_STYLE is set
-            // to a value we don't understand, then fall back to the default.
-            warn_invalid_quoting_style(&style);
-            QuotingStyle::default()
-        }),
-        Err(_) => QuotingStyle::default(),
-    };
-
     if file_type.is_symlink() {
-        let quoted_display_name = quote_file_name(display_name, &quoting_style);
+        let quoted_display_name = quote_file_name(OsStr::new(display_name), quoting_style);
         match fs::read_link(file) {
             Ok(dst) => {
-                let quoted_dst = quote_file_name(&dst.to_string_lossy(), &quoting_style);
+                let quoted_dst = quote_file_name(dst.as_os_str(), quoting_style);
                 Ok(format!("{quoted_display_name} -> {quoted_dst}"))
             }
             Err(e) => {
@@ -584,16 +524,16 @@ fn get_quoted_file_name(
             }
         }
     } else {
-        let style = if from_user {
-            quoting_style
-        } else {
-            QuotingStyle::Quote
-        };
-        Ok(quote_file_name(display_name, &style))
+        Ok(quote_file_name(OsStr::new(display_name), quoting_style))
     }
 }
 
-fn process_token_filesystem(t: &Token, meta: &StatFs, display_name: &str) {
+fn process_token_filesystem(
+    t: &Token,
+    meta: &StatFs,
+    display_name: &str,
+    quote_name: impl Fn(&str) -> String,
+) {
     match *t {
         Token::Byte(byte) => print_raw_byte(byte),
         Token::Char(c) => print!("{c}"),
@@ -618,6 +558,8 @@ fn process_token_filesystem(t: &Token, meta: &StatFs, display_name: &str) {
                 'i' => OutputType::UnsignedHex(meta.fsid()),
                 // maximum length of filenames
                 'l' => OutputType::Unsigned(meta.namelen()),
+                // quoted file name
+                'n' if flag.quote => OutputType::Str(quote_name(display_name)),
                 // file name
                 'n' => OutputType::Str(display_name.to_string()),
                 // block size (for faster transfers)
@@ -674,7 +616,7 @@ fn print_integer(
 
 fn format_timestamp(seconds: i64, nanoseconds: u32, precision: Precision) -> String {
     let precision = match precision {
-        Precision::NotSpecified => return seconds.to_string(),
+        Precision::NotSpecified | Precision::Number(0) => return seconds.to_string(),
         Precision::NoNumber => 9,
         Precision::Number(p) => p,
     };
@@ -682,10 +624,11 @@ fn format_timestamp(seconds: i64, nanoseconds: u32, precision: Precision) -> Str
     let total_nanoseconds = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
     if precision <= 9 {
         let divisor = 10_i128.pow((9 - precision) as u32);
-        let value = total_nanoseconds.div_euclid(divisor);
-        format_scaled_decimal(value, precision)
+        // Integer seconds use the floor, but fractional output truncates toward zero.
+        let value = total_nanoseconds / divisor;
+        format_scaled_decimal(value, precision, total_nanoseconds < 0)
     } else {
-        let mut result = format_scaled_decimal(total_nanoseconds, 9);
+        let mut result = format_scaled_decimal(total_nanoseconds, 9, total_nanoseconds < 0);
         result.push_str(&"0".repeat(precision - 9));
         result
     }
@@ -700,16 +643,12 @@ fn system_time_to_timestamp(time: SystemTime) -> (i64, u32) {
     (seconds, nanoseconds)
 }
 
-fn format_scaled_decimal(value: i128, precision: usize) -> String {
-    if precision == 0 {
-        return value.to_string();
-    }
-
+fn format_scaled_decimal(value: i128, precision: usize, negative: bool) -> String {
     let scale = 10_u128.pow(precision as u32);
     let magnitude = value.unsigned_abs();
     let whole = magnitude / scale;
     let fraction = magnitude % scale;
-    let sign = if value < 0 { "-" } else { "" };
+    let sign = if negative { "-" } else { "" };
     format!("{sign}{whole}.{fraction:0>precision$}")
 }
 
@@ -816,9 +755,9 @@ fn print_raw_byte(byte: u8) {
 
 impl Stater {
     fn process_flags(chars: &[char], i: &mut usize, bound: usize, flag: &mut Flags) {
-        while *i < bound {
+        for &c in &chars[*i..bound] {
             #[expect(clippy::match_same_arms)] // needs comment
-            match chars[*i] {
+            match c {
                 '#' => flag.alter = true,
                 '0' => flag.zero = true,
                 '-' => flag.left = true,
@@ -854,6 +793,17 @@ impl Stater {
         let mut flag = Flags::default();
 
         Self::process_flags(chars, i, bound, &mut flag);
+
+        // GNU rejects flag-only fragments closed by another '%', e.g. `%++-+%`.
+        if *i < bound && chars[*i] == '%' {
+            let invalid_directive: String = chars[old..=*i].iter().collect();
+            return Err(DirectiveError::new(
+                format_str,
+                &invalid_directive,
+                old,
+                *i + 1,
+            ));
+        }
 
         let mut width = 0;
         let mut precision = Precision::NotSpecified;
@@ -914,6 +864,18 @@ impl Stater {
             });
         }
 
+        // `%Qn` is the quoted file name
+        if *i + 1 < bound && chars[*i] == 'Q' && chars[*i + 1] == 'n' {
+            flag.quote = true;
+            *i += 1;
+            return Ok(Token::Directive {
+                flag,
+                width,
+                precision,
+                format: 'n',
+            });
+        }
+
         Ok(Token::Directive {
             flag,
             width,
@@ -945,11 +907,14 @@ impl Stater {
             '"' => Token::Byte(b'"'),   // Double quote
             '0'..='7' => {
                 // Parse octal escape sequence (up to 3 digits)
-                let mut value = 0u8;
+                // Accumulate in a wider type: three octal digits can reach 511,
+                // and only the low byte is kept, which is what GNU prints for
+                // an out-of-range escape such as `\400`.
+                let mut value = 0u32;
                 let mut count = 0;
                 while *i < bound && count < 3 {
                     if let Some(digit) = chars[*i].to_digit(8) {
-                        value = value * 8 + digit as u8;
+                        value = value * 8 + digit;
                         *i += 1;
                         count += 1;
                     } else {
@@ -957,7 +922,7 @@ impl Stater {
                     }
                 }
                 *i -= 1; // Adjust index to account for the outer loop increment
-                Token::Byte(value)
+                Token::Byte(value as u8)
             }
             'x' => {
                 // Parse hexadecimal escape sequence (\xNN format)
@@ -999,7 +964,19 @@ impl Stater {
         while i < bound {
             match chars.get(i) {
                 Some('%') => match Self::handle_percent_case(&chars, &mut i, bound, format_str) {
-                    Ok(token) => tokens.push(token),
+                    Ok(token) => {
+                        // A directive takes a single byte as its conversion, so
+                        // after a multibyte char (always an unknown directive,
+                        // printed as `?`) the rest of its bytes are printed as is.
+                        let rest = match token {
+                            Token::Directive { format, .. } if !format.is_ascii() => {
+                                format.encode_utf8(&mut [0; 4]).as_bytes()[1..].to_vec()
+                            }
+                            _ => Vec::new(),
+                        };
+                        tokens.push(token);
+                        tokens.extend(rest.into_iter().map(Token::Byte));
+                    }
                     Err(error) => return (tokens, Some(error)),
                 },
                 Some('\\') => {
@@ -1015,9 +992,6 @@ impl Stater {
                 None => break,
             }
             i += 1;
-        }
-        if !use_printf && !format_str.ends_with('\n') {
-            tokens.push(Token::Char('\n'));
         }
         (tokens, None)
     }
@@ -1045,13 +1019,11 @@ impl Stater {
     }
 
     fn new(matches: &ArgMatches, diag_args: Option<&[OsString]>) -> UResult<Self> {
+        #[expect(clippy::unwrap_used, reason = "set as required by clap")]
         let files: Vec<OsString> = matches
             .get_many::<OsString>(options::FILES)
             .map(|v| v.map(OsString::from).collect())
-            .unwrap_or_default();
-        if files.is_empty() {
-            return Err(Box::new(StatError::MissingOperand) as Box<dyn UError>);
-        }
+            .unwrap();
         let format_str = if matches.contains_id(options::PRINTF) {
             matches
                 .get_one::<String>(options::PRINTF)
@@ -1091,7 +1063,12 @@ impl Stater {
             }
             tokens
         } else {
-            let (tokens, error) = Self::generate_tokens(format_str, use_printf);
+            let (mut tokens, error) = Self::generate_tokens(format_str, use_printf);
+            // `--format` always prints a newline after the output, even when
+            // the format already ends with one; `--printf` never adds one.
+            if !use_printf && error.is_none() {
+                tokens.push(Token::Char('\n'));
+            }
             format_error = error;
             tokens
         };
@@ -1115,11 +1092,20 @@ impl Stater {
             files,
             mount_list: OnceCell::new(),
             mount_list_needed,
+            quoting_style: OnceCell::new(),
             default_tokens,
             default_dev_tokens,
             format_option: format_error.is_some().then(given_option),
             format_error,
             diag_args: diag_args.map(<[OsString]>::to_vec),
+        })
+    }
+
+    fn quoting_style(&self) -> QuotingStyle {
+        *self.quoting_style.get_or_init(|| {
+            quoting_style_from_env()
+                .unwrap_or(QuotingStyle::SHELL_ESCAPE)
+                .show_control(true)
         })
     }
 
@@ -1168,7 +1154,6 @@ impl Stater {
         display_name: &str,
         file: &OsString,
         file_type: FileType,
-        from_user: bool,
         #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
         follow_symbolic_links: bool,
         #[cfg(not(all(feature = "selinux", any(target_os = "linux", target_os = "android"))))]
@@ -1254,12 +1239,21 @@ impl Stater {
                         Some(s) => OutputType::OsStr(s),
                         None => OutputType::Str(String::new()),
                     },
+                    // quoted file name
+                    'n' if flag.quote => OutputType::Str(quote_file_name(
+                        OsStr::new(display_name),
+                        self.quoting_style(),
+                    )),
                     // file name
                     'n' => OutputType::Str(display_name.to_string()),
                     // quoted file name with dereference if symbolic link
                     'N' => {
-                        let file_name =
-                            get_quoted_file_name(display_name, file, file_type, from_user)?;
+                        let file_name = get_quoted_file_name(
+                            display_name,
+                            file,
+                            file_type,
+                            self.quoting_style(),
+                        )?;
                         OutputType::Str(file_name)
                     }
                     // optimal I/O transfer size hint
@@ -1341,6 +1335,7 @@ impl Stater {
 
     fn do_stat(&self, file: &OsStr, stdin_is_fifo: bool) -> UResult<i32> {
         let display_name = file.to_string_lossy();
+        let quoted_name = || quote_file_name(file, QuotingStyle::SHELL_ESCAPE_ALWAYS);
         let file = if cfg!(unix) && display_name == "-" {
             if self.show_fs {
                 show_error!("{}", StatError::StdinFilesystemMode);
@@ -1361,7 +1356,9 @@ impl Stater {
 
                     // Usage
                     for t in tokens {
-                        process_token_filesystem(t, &meta, &display_name);
+                        process_token_filesystem(t, &meta, &display_name, |name| {
+                            quote_file_name(OsStr::new(name), self.quoting_style())
+                        });
                     }
                     self.raise_format_error()?;
                 }
@@ -1369,7 +1366,7 @@ impl Stater {
                     show_error!(
                         "{}",
                         StatError::CannotReadFilesystemInfo {
-                            file: display_name.quote().to_string(),
+                            file: quoted_name(),
                             error
                         }
                     );
@@ -1401,7 +1398,6 @@ impl Stater {
                             &display_name,
                             &file,
                             file_type,
-                            self.from_user,
                             follow_symbolic_links,
                         ) {
                             return Ok(code);
@@ -1413,7 +1409,7 @@ impl Stater {
                     show_error!(
                         "{}",
                         StatError::CannotStatx {
-                            file: display_name.quote().to_string(),
+                            file: quoted_name(),
                             error: strip_errno(&e)
                         }
                     );
@@ -1429,18 +1425,17 @@ impl Stater {
 
         if show_fs {
             if terse {
-                "%n %i %l %t %s %S %b %f %a %c %d\n".into()
+                "%Qn %i %l %t %s %S %b %f %a %c %d\n".into()
             } else {
                 format!(
-                    "  {}: \"%n\"\n    {}: %-8i {}: %-7l {}: %T\n{} \
-                         {}: %-10s {} {}: %S\n{}: {}: %-10b \
+                    "  {}: %Qn\n    {}: %-8i {}: %-7l {}: %T\n{}: %-10s \
+                         {} {}: %S\n{}: {}: %-10b \
                          {}: %-10f {}: %a\n{}: {}: %-10c {}: %d\n",
                     translate!("stat-word-file"),
                     translate!("stat-word-id"),
                     translate!("stat-word-namelen"),
                     translate!("stat-word-type"),
-                    translate!("stat-word-block"),
-                    translate!("stat-word-size"),
+                    translate!("stat-word-block-size-capitalized"),
                     translate!("stat-word-fundamental"),
                     translate!("stat-word-block-size"),
                     translate!("stat-word-blocks"),
@@ -1453,7 +1448,7 @@ impl Stater {
                 )
             }
         } else if terse {
-            "%n %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n".into()
+            "%Qn %s %b %f %u %g %D %i %h %t %T %X %Y %Z %W %o\n".into()
         } else {
             let device_line = if show_dev_type {
                 format!(
@@ -1496,8 +1491,11 @@ impl Stater {
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // The command line is kept for the caret in format diagnostics, which
     // needs the format as typed.
-    let (matches, diag_args) =
-        uucore::clap_localization::handle_clap_result_with_diagnostics(uu_app(), args.collect())?;
+    let (matches, diag_args) = uucore::clap_localization::handle_clap_result_with_diagnostics(
+        uu_app(),
+        args.collect(),
+        1,
+    )?;
 
     let stater = Stater::new(&matches, diag_args.as_deref())?;
     let exit_status = stater.exec()?;
@@ -1542,18 +1540,21 @@ pub fn uu_app() -> Command {
                 .short('c')
                 .long(options::FORMAT)
                 .help(translate!("stat-help-format"))
-                .value_name("FORMAT"),
+                .value_name("FORMAT")
+                .allow_hyphen_values(true),
         )
         .arg(
             Arg::new(options::PRINTF)
                 .long(options::PRINTF)
                 .value_name("FORMAT")
+                .allow_hyphen_values(true)
                 .help(translate!("stat-help-printf")),
         )
         .arg(
             Arg::new(options::FILES)
                 .action(ArgAction::Append)
                 .value_parser(ValueParser::os_string())
+                .required(true)
                 .value_hint(clap::ValueHint::FilePath),
         )
 }
@@ -1580,6 +1581,8 @@ fn pretty_time(meta: &Metadata, md_time_field: MetadataTimeField) -> String {
 #[cfg(test)]
 mod tests {
     use crate::{quote_file_name, write_padded_bytes, write_padding};
+    use std::ffi::OsStr;
+    use uucore::quoting_style::QuotingStyle;
 
     use super::{Flags, Precision, ScanUtil, Stater, Token, format_timestamp, group_num};
 
@@ -1724,13 +1727,30 @@ mod tests {
             (Precision::NotSpecified, "-1"),
             (Precision::NoNumber, "-0.876543211"),
             (Precision::Number(0), "-1"),
-            (Precision::Number(1), "-0.9"),
-            (Precision::Number(3), "-0.877"),
+            (Precision::Number(1), "-0.8"),
+            (Precision::Number(3), "-0.876"),
             (Precision::Number(9), "-0.876543211"),
             (Precision::Number(10), "-0.8765432110"),
         ];
         for (precision, expected) in pre_epoch_cases {
             assert_eq!(format_timestamp(-1, 123_456_789, precision), expected);
+        }
+    }
+
+    #[test]
+    fn test_format_timestamp_negative_fraction_truncation() {
+        for (seconds, nanoseconds, precision, expected) in [
+            (-3, 765_432_109, Precision::NotSpecified, "-3"),
+            (-3, 765_432_109, Precision::Number(0), "-3"),
+            (-3, 765_432_109, Precision::Number(2), "-2.23"),
+            (-3, 765_432_109, Precision::Number(6), "-2.234567"),
+            (-1, 999_999_999, Precision::Number(1), "-0.0"),
+            (-1, 999_999_999, Precision::Number(3), "-0.000"),
+            (-1, 999_999_999, Precision::Number(9), "-0.000000001"),
+            (-1, 999_999_999, Precision::Number(10), "-0.0000000010"),
+            (-3, 0, Precision::Number(3), "-3.000"),
+        ] {
+            assert_eq!(format_timestamp(seconds, nanoseconds, precision), expected);
         }
     }
 
@@ -1766,13 +1786,13 @@ mod tests {
     fn test_quote_file_name() {
         let file_name = "nice' file";
         assert_eq!(
-            quote_file_name(file_name, &crate::QuotingStyle::ShellEscapeAlways),
+            quote_file_name(OsStr::new(file_name), QuotingStyle::SHELL_ESCAPE_ALWAYS),
             "\"nice' file\""
         );
 
         let file_name = "nice\" file";
         assert_eq!(
-            quote_file_name(file_name, &crate::QuotingStyle::ShellEscapeAlways),
+            quote_file_name(OsStr::new(file_name), QuotingStyle::SHELL_ESCAPE_ALWAYS),
             "\'nice\" file\'"
         );
     }

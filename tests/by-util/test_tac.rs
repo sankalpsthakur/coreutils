@@ -2,7 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore axxbxx bxxaxx axxx axxxx xxaxx xxax xxxxa axyz zyax zyxa bbaaa aaabc bcdddd cddddaaabc xyzabc abcxyzabc nbbaaa EISDIR SIGBUS mmap
+
 #[cfg(unix)]
 use uutests::at_and_ucmd;
 use uutests::new_ucmd;
@@ -55,6 +57,21 @@ fn test_stdin_non_newline_separator_before() {
 }
 
 #[test]
+fn test_separator_starting_with_hyphen() {
+    for args in [
+        &["-s", "-1"][..],
+        &["--separator", "-1"],
+        &["--separator=-1"],
+    ] {
+        new_ucmd!()
+            .args(args)
+            .pipe_in("a-1b-1")
+            .succeeds()
+            .stdout_is("b-1a-1");
+    }
+}
+
+#[test]
 fn test_single_default() {
     new_ucmd!()
         .arg("prime_per_line.txt")
@@ -103,6 +120,23 @@ fn test_invalid_input() {
 }
 
 #[test]
+#[cfg(not(windows))]
+fn test_numeric_looking_file_names_are_kept_verbatim() {
+    // File names such as "007" or "1e3" must not be reformatted as numbers
+    // in error messages.
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("007");
+    at.mkdir("1e3");
+    ucmd.args(&["007", "1e3", "2.50"])
+        .fails_with_code(1)
+        .stderr_is(
+            "tac: 007: read error: Is a directory\n\
+             tac: 1e3: read error: Is a directory\n\
+             tac: failed to open '2.50' for reading: No such file or directory\n",
+        );
+}
+
+#[test]
 fn test_no_line_separators() {
     new_ucmd!().pipe_in("a").succeeds().stdout_is("a");
 }
@@ -145,7 +179,7 @@ fn test_before_no_separator() {
 
 #[test]
 fn test_before_empty_file() {
-    new_ucmd!().arg("-b").pipe_in("").succeeds().stdout_is("");
+    new_ucmd!().arg("-b").pipe_in("").succeeds().no_output();
 }
 
 #[test]

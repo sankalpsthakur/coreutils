@@ -2,6 +2,7 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore (words) autoformat nocheck FILENUM
 
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
@@ -10,6 +11,7 @@ use std::fs::OpenOptions;
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 #[cfg(windows)]
 use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+use uutests::at_and_ucmd;
 use uutests::new_ucmd;
 use uutests::util::TestScenario;
 use uutests::util_name;
@@ -201,6 +203,25 @@ fn case_insensitive() {
 }
 
 #[test]
+fn case_insensitive_prints_each_lines_own_key() {
+    // Keys that differ only in case form one group with -i, but each output
+    // line still shows the key from its own file1 line.
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("f", "b z\n");
+    ucmd.args(&["-i", "-", "f"])
+        .pipe_in("B x\nb y\n")
+        .succeeds()
+        .stdout_only("B x z\nb y z\n");
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("f", "B\n");
+    ucmd.args(&["-i", "-o", "0", "-", "f"])
+        .pipe_in("B\nb\n")
+        .succeeds()
+        .stdout_only("B\nb\n");
+}
+
+#[test]
 fn semicolon_separated() {
     new_ucmd!()
         .arg("semicolon_fields_1.txt")
@@ -231,7 +252,21 @@ fn tab_multi_character() {
         .arg("-t")
         .arg("ab")
         .fails()
-        .stderr_is("join: multi-character tab ab\n");
+        .stderr_is("join: multi-character tab 'ab'\n");
+}
+
+#[test]
+fn tab_hyphen_leading_as_separate_arg() {
+    // A hyphen-leading separator value passed as its own argument (not
+    // attached with `-t-x`/`=`) must not be mistaken for a new,
+    // unrecognized flag.
+    new_ucmd!()
+        .arg("semicolon_fields_1.txt")
+        .arg("semicolon_fields_2.txt")
+        .arg("-t")
+        .arg("-x")
+        .fails()
+        .stderr_is("join: multi-character tab '-x'\n");
 }
 
 #[test]
@@ -249,6 +284,50 @@ fn default_format() {
         .arg("fields_2.txt")
         .arg("-o")
         .arg("0 2.2")
+        .succeeds()
+        .stdout_only_fixture("default.expected");
+}
+
+#[test]
+fn repeated_o_accumulates_fields() {
+    // GNU lets -o repeat; the fields accumulate in the order they appear,
+    // here giving the reverse of the default format.
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_2.txt")
+        .arg("-o")
+        .arg("2.2")
+        .arg("-o")
+        .arg("1.1")
+        .succeeds()
+        .stdout_only("a 1\nb 2\nc 3\ne 5\nh 8\n");
+}
+
+#[test]
+fn repeated_o_ignores_auto_when_mixed() {
+    // When -o is repeated and not every value is `auto`, each `auto` is
+    // ignored: only the explicit fields are printed, repeats included.
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_2.txt")
+        .arg("-o")
+        .arg("auto")
+        .arg("-o")
+        .arg("2.2 2.2 1.1")
+        .succeeds()
+        .stdout_only("a a 1\nb b 2\nc c 3\ne e 5\nh h 8\n");
+}
+
+#[test]
+fn repeated_o_auto_stays_auto() {
+    // `auto` still applies when every -o value is `auto`.
+    new_ucmd!()
+        .arg("fields_1.txt")
+        .arg("fields_2.txt")
+        .arg("-o")
+        .arg("auto")
+        .arg("-o")
+        .arg("auto")
         .succeeds()
         .stdout_only_fixture("default.expected");
 }
@@ -404,6 +483,27 @@ fn empty_fields_kept_without_empty_filler() {
 }
 
 #[test]
+fn repeated_empty_filler() {
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
+
+    at.write("a", "1 a\n2 b\n");
+    at.write("b", "1 c\n");
+
+    // -e may be given more than once with the same string.
+    ts.ucmd()
+        .args(&["-a1", "-e", "d", "-e", "d", "-o", "1.1,1.2,2.2", "a", "b"])
+        .succeeds()
+        .stdout_only("1 a c\n2 b d\n");
+
+    // Different strings conflict.
+    ts.ucmd()
+        .args(&["-a1", "-e", "d", "-e", "e", "-o", "1.1,1.2,2.2", "a", "b"])
+        .fails_with_code(1)
+        .stderr_only("join: conflicting empty-field replacement strings\n");
+}
+
+#[test]
 fn nocheck_order() {
     new_ucmd!()
         .arg("fields_1.txt")
@@ -512,6 +612,7 @@ fn non_line_feeds() {
 }
 
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv must be valid UTF-8")]
 fn non_unicode() {
     new_ucmd!()
         .arg("non-unicode_1.bin")
@@ -587,6 +688,7 @@ fn null_line_endings() {
 
 #[test]
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+#[cfg_attr(wasip2_runner, ignore = "WASI P2: /dev/full filesystem not available")]
 fn test_full() {
     let dev_full = OpenOptions::new().write(true).open("/dev/full").unwrap();
     new_ucmd!()
@@ -599,6 +701,7 @@ fn test_full() {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn test_join_non_utf8_paths() {
     use std::fs::File;
     use std::io::Write;
@@ -646,6 +749,7 @@ fn join_emoji_delim_inner_key() {
 
 #[cfg(unix)]
 #[test]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: locale database not visible")]
 fn test_locale_collation() {
     let ts = TestScenario::new(util_name!());
     let at = &ts.fixtures;
@@ -661,6 +765,61 @@ fn test_locale_collation() {
         .succeeds()
         .stdout_contains("abc:d 2 y")
         .stdout_contains("ab:d 1 x");
+}
+
+#[test]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI: usize::MAX is computed for the 64-bit host test binary, \
+              but the wasm32 target binary saturates at the 32-bit usize::MAX"
+)]
+fn test_incompatible_fields_reports_exact_field_number() {
+    // An out-of-range field clamps to usize::MAX, which used to overflow the
+    // one-based increment. Field numbers past 2^53 also used to be rounded on
+    // their way through the localization layer.
+    //
+    // `parse_field_number` uses `usize`, so a value at or above `usize::MAX`
+    // saturates to it. The saturation ceiling is therefore pointer-width
+    // dependent, and the expected text is built from `usize::MAX` rather than a
+    // hard-coded 64-bit literal.
+    let max_field = usize::MAX.to_string();
+
+    // A small field number takes the i64 number path through the localization
+    // layer and is platform-independent.
+    new_ucmd!()
+        .args(&["-j", "3", "-1", "5", "/dev/null", "/dev/null"])
+        .fails()
+        .stderr_contains("incompatible join fields 3, 5");
+
+    // Values at or above `usize::MAX` saturate to `usize::MAX` on every
+    // platform; the localization layer must carry that ceiling as an exact
+    // decimal string rather than rounding it through Fluent's f64-backed number
+    // type.
+    for field in ["18446744073709551615", "99999999999999999999999"] {
+        new_ucmd!()
+            .args(&["-j", field, "-1", "5", "/dev/null", "/dev/null"])
+            .fails()
+            .stderr_contains(format!("incompatible join fields {max_field}, 5"));
+    }
+
+    // A value above f64 precision (2^53) but below `usize::MAX` is reported
+    // exactly on 64-bit (where `usize` holds it); on 32-bit it saturates to
+    // `usize::MAX` like the cases above.
+    #[cfg(target_pointer_width = "64")]
+    let expected_above: String = "9007199254740993".to_string();
+    #[cfg(not(target_pointer_width = "64"))]
+    let expected_above: String = max_field.clone();
+    new_ucmd!()
+        .args(&[
+            "-j",
+            "9007199254740993",
+            "-1",
+            "5",
+            "/dev/null",
+            "/dev/null",
+        ])
+        .fails()
+        .stderr_contains(format!("incompatible join fields {expected_above}, 5"));
 }
 
 #[cfg(all(feature = "feat_diagnostics", not(wasi_runner)))]
@@ -710,4 +869,45 @@ join: invalid field number: 'x'
             .fails_with_code(1)
             .stderr_is("join: invalid field number: 'x'\n");
     }
+}
+
+#[test]
+fn test_hyphen_leading_field_number_is_reported_as_invalid() {
+    // GNU hands the argument after the option to that option even when it
+    // starts with a hyphen, so it is reported as an invalid field number
+    // rather than as an unknown option.
+    for opt in ["-1", "-2", "-j"] {
+        new_ucmd!()
+            .args(&[opt, "-1", "empty.txt", "empty.txt"])
+            .fails()
+            .stderr_contains("invalid field number: '-1'");
+    }
+}
+
+#[test]
+fn test_invalid_file_number() {
+    for (option, value) in [("-a", "3"), ("-a", "x"), ("-v", "0")] {
+        new_ucmd!()
+            .args(&[option, value, "fields_1.txt", "fields_2.txt"])
+            .fails_with_code(1)
+            .stderr_only(format!("join: invalid file number: '{value}'\n"));
+    }
+}
+
+#[test]
+fn test_operand_count() {
+    new_ucmd!()
+        .fails_with_code(1)
+        .stderr_contains("join: missing operand\n")
+        .stderr_contains("--help");
+    new_ucmd!()
+        .args(&["-t", "x", "fields_1.txt"])
+        .fails_with_code(1)
+        .stderr_contains("join: missing operand after 'fields_1.txt'\n")
+        .stderr_contains("--help");
+    new_ucmd!()
+        .args(&["fields_1.txt", "fields_2.txt", "fields_3.txt"])
+        .fails_with_code(1)
+        .stderr_contains("join: extra operand 'fields_3.txt'\n")
+        .stderr_contains("--help");
 }

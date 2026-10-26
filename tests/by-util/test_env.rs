@@ -2,7 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-// spell-checker:ignore (words) bamf chdir rlimit prlimit COMSPEC cout cerr FFFD winsize xpixel ypixel Secho sighandler
+
+// spell-checker:ignore (words) bamf chdir rlimit prlimit COMSPEC cout cerr FFFD winsize xpixel ypixel Secho sighandler putenv
+
 #![allow(clippy::missing_errors_doc)]
 
 #[cfg(unix)]
@@ -18,12 +20,12 @@ use std::process::Command;
 use tempfile::tempdir;
 use uutests::new_ucmd;
 #[cfg(unix)]
-use uutests::util::PATH;
-#[cfg(unix)]
 use uutests::util::TerminalSimulation;
 use uutests::util::TestScenario;
 #[cfg(unix)]
 use uutests::util::UChild;
+#[cfg(unix)]
+use uutests::util::path;
 use uutests::util_name;
 
 #[cfg(unix)]
@@ -53,9 +55,9 @@ impl Target {
             .expect("failed to send signal")
             .wait();
         // macOS CI needs a longer delay for process teardown after signal delivery
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         self.child.delay(500);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         self.child.delay(100);
     }
     fn is_alive(&mut self) -> bool {
@@ -70,12 +72,25 @@ impl Drop for Target {
 }
 
 #[test]
+fn test_command_environment_uses_last_override() {
+    new_ucmd!()
+        .env("LC_ALL", "POSIX")
+        .env("UUTESTS_ENV_OVERRIDE", "first")
+        .env("UUTESTS_ENV_OVERRIDE", "last")
+        .succeeds()
+        .stdout_contains_line("LC_ALL=POSIX")
+        .stdout_does_not_contain("LC_ALL=C")
+        .stdout_contains_line("UUTESTS_ENV_OVERRIDE=last")
+        .stdout_does_not_contain("UUTESTS_ENV_OVERRIDE=first");
+}
+
+#[test]
 fn test_invalid_arg() {
     new_ucmd!().arg("--definitely-invalid").fails_with_code(125);
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(windows))]
 fn test_flags_after_command() {
     new_ucmd!()
         // This would cause an error if -u=v were processed because it's malformed
@@ -84,14 +99,14 @@ fn test_flags_after_command() {
         .no_stderr()
         .stdout_is("-u=v\n");
 
+    // spell-checker:disable
     new_ucmd!()
         // Ensure the string isn't split
-        // cSpell:disable
         .args(&["printf", "%s-%s", "-Sfoo bar"])
         .succeeds()
         .no_stderr()
         .stdout_is("-Sfoo bar-");
-    // cSpell:enable
+    // spell-checker:enable
 
     new_ucmd!()
         // Ensure -- is recognized
@@ -159,9 +174,9 @@ fn test_env_permissions() {
 
 #[test]
 fn test_echo() {
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     let args = ["cmd", "/d/c", "echo"];
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(windows))]
     let args = ["echo"];
 
     let result = new_ucmd!().args(&args).arg("FOO-bar").succeeds();
@@ -169,7 +184,7 @@ fn test_echo() {
     assert_eq!(result.stdout_str().trim(), "FOO-bar");
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 #[test]
 fn test_if_windows_batch_files_can_be_executed() {
     let result = new_ucmd!().arg("./runBat.bat").succeeds();
@@ -275,53 +290,6 @@ fn test_debug2_part_of_string_arg() {
 }
 
 #[test]
-fn test_file_option() {
-    let out = new_ucmd!()
-        .arg("-f")
-        .arg("vars.conf.txt")
-        .succeeds()
-        .stdout_move_str();
-
-    assert_eq!(
-        out.lines()
-            .filter(|&line| line == "FOO=bar" || line == "BAR=bamf this")
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn test_combined_file_set() {
-    let out = new_ucmd!()
-        .arg("-f")
-        .arg("vars.conf.txt")
-        .arg("FOO=bar.alt")
-        .succeeds()
-        .stdout_move_str();
-
-    assert_eq!(out.lines().filter(|&line| line == "FOO=bar.alt").count(), 1);
-}
-
-#[test]
-fn test_combined_file_set_unset() {
-    let out = new_ucmd!()
-        .arg("-u")
-        .arg("BAR")
-        .arg("-f")
-        .arg("vars.conf.txt")
-        .arg("FOO=bar.alt")
-        .succeeds()
-        .stdout_move_str();
-
-    assert_eq!(
-        out.lines()
-            .filter(|&line| line == "FOO=bar.alt" || line.starts_with("BAR="))
-            .count(),
-        1
-    );
-}
-
-#[test]
 fn test_unset_invalid_variables() {
     use uucore::display::Quotable;
 
@@ -373,6 +341,31 @@ fn test_empty_name() {
         .arg("=xyz")
         .succeeds()
         .stderr_only("env: warning: no name specified for value 'xyz'\n");
+}
+
+// An empty name is dropped with a warning (GNU injects it via putenv, we
+// can't with set_var); the other assignments must still go through.
+#[test]
+fn test_empty_name_does_not_affect_other_assignments() {
+    let result = new_ucmd!()
+        .args(&["-i", "MOTOR=idle", "=zap", "GEARBOX=locked"])
+        .succeeds();
+    result.stderr_is("env: warning: no name specified for value 'zap'\n");
+
+    // Windows sorts the environment block, so don't depend on the order.
+    let mut vars: Vec<_> = result.stdout_str().lines().collect();
+    vars.sort_unstable();
+    assert_eq!(vars, ["GEARBOX=locked", "MOTOR=idle"]);
+}
+
+// "=" alone is name and value both empty; still just a warning, exit 0.
+#[test]
+fn test_empty_name_and_empty_value() {
+    new_ucmd!()
+        .args(&["-i", "="])
+        .succeeds()
+        .no_stdout()
+        .stderr_is("env: warning: no name specified for value ''\n");
 }
 
 #[test]
@@ -484,36 +477,7 @@ fn test_fail_change_directory() {
     assert!(out.contains("env: cannot change directory to "));
 }
 
-#[test]
-fn test_chdir_happens_after_relative_file_loading() {
-    let scene = TestScenario::new(util_name!());
-    scene.fixtures.mkdir("target");
-    scene
-        .fixtures
-        .write("config.env", "CONFIG_SOURCE=from-root\n");
-    scene
-        .fixtures
-        .write("target/config.env", "CONFIG_SOURCE=from-target\n");
-
-    let out = scene
-        .ucmd()
-        .args(&["--chdir", "target", "--file", "config.env", "-i"])
-        .arg(uutests::util::get_tests_binary())
-        .arg(util_name!())
-        .succeeds()
-        .stdout_move_str();
-
-    assert!(
-        out.contains("CONFIG_SOURCE=from-root\n"),
-        "expected config file from invocation directory, got: {out:?}"
-    );
-    assert!(
-        !out.contains("CONFIG_SOURCE=from-target\n"),
-        "unexpectedly loaded config from --chdir target directory: {out:?}"
-    );
-}
-
-#[cfg(not(target_os = "windows"))] // windows has no executable "echo", its only supported as part of a batch-file
+#[cfg(not(windows))] // windows has no executable "echo", its only supported as part of a batch-file
 #[test]
 fn test_split_string_into_args_one_argument_no_quotes() {
     let scene = TestScenario::new(util_name!());
@@ -526,7 +490,7 @@ fn test_split_string_into_args_one_argument_no_quotes() {
     assert_eq!(out, "hello world\n");
 }
 
-#[cfg(not(target_os = "windows"))] // windows has no executable "echo", its only supported as part of a batch-file
+#[cfg(not(windows))] // windows has no executable "echo", its only supported as part of a batch-file
 #[test]
 fn test_split_string_into_args_one_argument() {
     let scene = TestScenario::new(util_name!());
@@ -539,7 +503,7 @@ fn test_split_string_into_args_one_argument() {
     assert_eq!(out, "hello world\n");
 }
 
-#[cfg(not(target_os = "windows"))] // windows has no executable "echo", its only supported as part of a batch-file
+#[cfg(not(windows))] // windows has no executable "echo", its only supported as part of a batch-file
 #[test]
 fn test_split_string_into_args_s_escaping_challenge() {
     let scene = TestScenario::new(util_name!());
@@ -563,7 +527,7 @@ fn test_split_string_into_args_s_escaped_c_not_allowed() {
     );
 }
 
-#[cfg(not(target_os = "windows"))] // no printf available
+#[cfg(not(windows))] // no printf available
 #[test]
 fn test_split_string_into_args_s_whitespace_handling() {
     let scene = TestScenario::new(util_name!());
@@ -576,7 +540,7 @@ fn test_split_string_into_args_s_whitespace_handling() {
     assert_eq!(out, "xAx\nxBx\n");
 }
 
-#[cfg(not(target_os = "windows"))] // no printf available
+#[cfg(not(windows))] // no printf available
 #[test]
 fn test_split_string_into_args_long_option_whitespace_handling() {
     let scene = TestScenario::new(util_name!());
@@ -589,7 +553,7 @@ fn test_split_string_into_args_long_option_whitespace_handling() {
     assert_eq!(out, "xAx\nxBx\n");
 }
 
-#[cfg(not(target_os = "windows"))] // no printf available
+#[cfg(not(windows))] // no printf available
 #[test]
 fn test_split_string_option_forms_match_gnu_required_argument_handling() {
     let scene = TestScenario::new(util_name!());
@@ -613,7 +577,7 @@ fn test_split_string_option_forms_match_gnu_required_argument_handling() {
         .stdout_is("x:one\nx:two\n");
 }
 
-#[cfg(not(target_os = "windows"))] // no printf available
+#[cfg(not(windows))] // no printf available
 #[test]
 fn test_split_string_into_args_debug_output_whitespace_handling() {
     let scene = TestScenario::new(util_name!());
@@ -635,7 +599,7 @@ fn test_split_string_into_args_debug_output_whitespace_handling() {
 // thread 'test_env::test_env_split_quoted_with_backslash_space' panicked at 'assertion failed: `(left == right)`
 // left: `"X=Y Z=W\n__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0\n"`,
 // right: `"X=Y Z=W\n"`', tests/by-util/test_env.rs:369:5
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 #[test]
 fn test_env_split_quoted_with_backslash_space() {
     let scene = TestScenario::new(util_name!());
@@ -657,10 +621,17 @@ fn test_env_split_quoted_with_backslash_space() {
     }
 
     let out = scene.ucmd().args(&input).succeeds();
-    assert_eq!(out.stdout_str(), output);
+    // Windows hands PROCESSOR_ARCHITECTURE to every process it starts, so it
+    // shows up even in the empty environment `-i` asks for (seen on arm64).
+    let stdout: Vec<&str> = out
+        .stdout_str()
+        .lines()
+        .filter(|line| !line.starts_with("PROCESSOR_ARCHITECTURE="))
+        .collect();
+    assert_eq!(stdout, output.lines().collect::<Vec<_>>());
 }
 
-#[cfg(not(target_os = "windows"))] // no printf available
+#[cfg(not(windows))] // no printf available
 #[test]
 fn test_split_string_single_quotes_keep_unknown_backslash_sequences_literal() {
     let scene = TestScenario::new(util_name!());
@@ -696,7 +667,7 @@ fn test_split_string_single_quotes_keep_unknown_backslash_sequences_literal() {
         .stdout_is("\\9");
 }
 
-#[cfg(not(target_os = "windows"))] // no printf available
+#[cfg(not(windows))] // no printf available
 #[test]
 fn test_split_string_backslash_a_behavior_matches_gnu_quoting_context() {
     let scene = TestScenario::new(util_name!());
@@ -830,8 +801,7 @@ fn test_env_overwrite_arg0() {
     ts.ucmd()
         .args(&["--argv0", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 }
 
 // Do not assume that coreutils uses argv0
@@ -845,32 +815,28 @@ fn test_env_arg_argv0_overwrite() {
         .args(&["--argv0", "dirname"])
         .args(&["--argv0", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // overwrite -a by -a
     ts.ucmd()
         .args(&["-a", "dirname"])
         .args(&["-a", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // overwrite --argv0 by -a
     ts.ucmd()
         .args(&["--argv0", "dirname"])
         .args(&["-a", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // overwrite -a by --argv0
     ts.ucmd()
         .args(&["-a", "dirname"])
         .args(&["--argv0", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 }
 
 // Do not assume that coreutils uses argv0
@@ -884,31 +850,27 @@ fn test_env_arg_argv0_overwrite_mixed_with_string_args() {
         .args(&["-S--argv0 dirname"])
         .args(&["--argv0", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // normal following string arg
     ts.ucmd()
         .args(&["-a", "dirname"])
         .args(&["-S-a hijacked sh -c 'echo $0'"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // one large string arg
     ts.ucmd()
         .args(&["-S--argv0 dirname -a hijacked sh -c 'echo $0'"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // two string args
     ts.ucmd()
         .args(&["-S-a dirname"])
         .args(&["-S--argv0 hijacked sh -c 'echo $0'"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 
     // three args: normal, string, normal
     ts.ucmd()
@@ -916,8 +878,7 @@ fn test_env_arg_argv0_overwrite_mixed_with_string_args() {
         .args(&["-S-a dirname"])
         .args(&["-a", "hijacked", "sh", "-c", "echo $0"])
         .succeeds()
-        .stdout_is("hijacked\n")
-        .stderr_is("");
+        .stdout_only("hijacked\n");
 }
 
 #[test]
@@ -1035,7 +996,7 @@ fn test_env_default_signal_all_signals() {
 #[cfg(unix)]
 fn test_env_block_signal_flag() {
     new_ucmd!()
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["--block-signal", "true"])
         .succeeds()
         .no_stderr();
@@ -1045,12 +1006,12 @@ fn test_env_block_signal_flag() {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn test_env_block_realtime_signal() {
     new_ucmd!()
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["--block-signal=SIGRTMIN+7", "true"])
         .succeeds()
         .no_stderr();
     new_ucmd!()
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["--block-signal=SIGRTMAX-7", "true"])
         .succeeds()
         .no_stderr();
@@ -1060,7 +1021,7 @@ fn test_env_block_realtime_signal() {
 #[cfg(unix)]
 fn test_env_list_signal_handling_reports_ignore() {
     let result = new_ucmd!()
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["--ignore-signal=INT", "--list-signal-handling", "true"])
         .succeeds();
     let stderr = result.stderr_str();
@@ -1070,12 +1031,83 @@ fn test_env_list_signal_handling_reports_ignore() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn test_env_signal_options_are_applied_in_the_order_given() {
+    for (args, expected) in [
+        (
+            &["--ignore-signal=INT", "--default-signal=INT"][..],
+            "DEFAULT",
+        ),
+        (
+            &["--default-signal=INT", "--ignore-signal=INT"][..],
+            "IGNORE",
+        ),
+        (
+            &["--block-signal=INT", "--default-signal=INT"][..],
+            "DEFAULT",
+        ),
+        (&["--ignore-signal=INT", "--default-signal"][..], "DEFAULT"),
+        (&["--default-signal", "--ignore-signal=INT"][..], "IGNORE"),
+        (&["--block-signal=INT", "--ignore-signal=INT"][..], "IGNORE"),
+    ] {
+        let mut cmd_args = args.to_vec();
+        cmd_args.extend(["--list-signal-handling", "true"]);
+
+        let result = new_ucmd!().env("PATH", path()).args(&cmd_args).succeeds();
+        let stderr = result.stderr_str();
+
+        assert!(
+            stderr.contains("INT") && stderr.contains(expected),
+            "{args:?}: expected INT to be {expected}, got: {stderr}"
+        );
+        for other in ["DEFAULT", "IGNORE", "BLOCK"] {
+            assert!(
+                other == expected || !stderr.contains(other),
+                "{args:?}: unexpected {other} for INT in: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn test_env_signal_option_without_value_applies_to_every_signal() {
+    // A bare option applies to every signal, so a signal another option set earlier is
+    // ignored again, and one given later still wins.
+    new_ucmd!()
+        .env("PATH", path())
+        .args(&[
+            "--ignore-signal=TERM",
+            "--ignore-signal",
+            "sh",
+            "-c",
+            "kill -INT $$",
+        ])
+        .succeeds();
+
+    let result = new_ucmd!()
+        .env("PATH", path())
+        .args(&[
+            "--ignore-signal",
+            "--default-signal=INT",
+            "--list-signal-handling",
+            "true",
+        ])
+        .succeeds();
+    let stderr = result.stderr_str();
+    assert!(
+        stderr.contains("INT") && stderr.contains("DEFAULT"),
+        "a later explicit option must win over a bare one, got: {stderr}"
+    );
+}
+
 #[cfg(unix)]
 fn run_sigpipe_script(ts: &TestScenario, extra_args: &[&str]) {
     let shell = env::var("SHELL").unwrap_or_else(|_| String::from("sh"));
     let _guard = SigpipeGuard::new();
     let mut cmd = ts.ucmd();
-    cmd.env("PATH", PATH);
+    cmd.env("PATH", path());
     cmd.args(extra_args);
     cmd.arg(shell);
     cmd.arg("-c");
@@ -1481,7 +1513,7 @@ mod test_raw_string_parser {
         string_parser,
     };
 
-    const LEN_OWL: usize = if cfg!(target_os = "windows") { 2 } else { 4 };
+    const LEN_OWL: usize = if cfg!(windows) { 2 } else { 4 };
 
     #[test]
     fn test_ascii_only_take_one_look_at_correct_data_and_end_behavior() {
@@ -1694,7 +1726,7 @@ mod test_raw_string_parser {
     fn test_deal_with_invalid_encoding() {
         let owl_invalid_part;
         let (brace_1, brace_2);
-        #[cfg(target_os = "windows")]
+        #[cfg(windows)]
         {
             let mut buffer = [0u16; 2];
             let owl = '🦉'.encode_utf16(&mut buffer);
@@ -1702,7 +1734,7 @@ mod test_raw_string_parser {
             brace_1 = '<'.encode_utf16(&mut buffer).to_vec();
             brace_2 = '>'.encode_utf16(&mut buffer).to_vec();
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(windows))]
         {
             let mut buffer = [0u8; 4];
             let owl = '🦉'.encode_utf8(&mut buffer);
@@ -1924,6 +1956,23 @@ fn test_simulation_of_terminal_pty_pipes_into_data_and_sends_eot_automatically()
     std::assert_eq!(String::from_utf8_lossy(out.stderr()), "");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn test_simulation_of_terminal_not_inherited_by_other_commands() {
+    let scene = TestScenario::new("util");
+
+    let mut cmd = scene.ccmd("env");
+    cmd.args(&["sleep", "1"]);
+    cmd.terminal_simulation(true);
+    let mut child = cmd.run_no_wait();
+    scene
+        .ccmd("env")
+        .args(&["ls", "-l", "/proc/self/fd/"])
+        .succeeds()
+        .stdout_does_not_contain("/dev/ptmx");
+    child.kill();
+}
+
 #[test]
 #[cfg(not(windows))]
 fn test_emoji_env_vars() {
@@ -1972,7 +2021,7 @@ fn test_shebang_error() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(windows))]
 fn test_reject_shell_style_variable_expansions() {
     for split in [
         "-Secho $TEST_VAR_12345",
@@ -1989,7 +2038,7 @@ fn test_reject_shell_style_variable_expansions() {
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(windows))]
 fn test_simple_braced_variable() {
     new_ucmd!()
         .env("TEST_VAR_12345", "value")

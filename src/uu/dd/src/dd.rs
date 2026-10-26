@@ -3,7 +3,7 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore fname, ftype, tname, fpath, specfile, testfile, unspec, ifile, ofile, outfile, fullblock, urand, fileio, atoe, atoibm, behaviour, bmax, bremain, cflags, creat, ctable, ctty, datastructures, doesnt, etoa, fileout, fname, gnudd, iconvflags, iseek, nocache, noctty, noerror, nofollow, nolinks, nonblock, oconvflags, oseek, outfile, parseargs, rlen, rmax, rremain, rsofar, rstat, sigusr, wlen, wstat oconv canonicalized FADV DONTNEED ESPIPE SPIPE bufferedoutput, SETFL
+// spell-checker:ignore fname, ftype, tname, fpath, specfile, testfile, unspec, ifile, ofile, outfile, fullblock, urand, fileio, atoe, atoibm, behaviour, bmax, bremain, cflags, creat, ctable, ctty, datastructures, doesnt, etoa, fileout, fname, gnudd, iconvflags, iseek, nocache, noctty, noerror, nofollow, nolinks, nonblock, oconvflags, oseek, outfile, parseargs, rlen, rmax, rremain, rsofar, rstat, sigusr, virtio, wlen, wstat, zram, oconv canonicalized FADV DONTNEED ESPIPE SPIPE bufferedoutput, SETFL
 
 mod blocks;
 mod bufferedoutput;
@@ -15,7 +15,7 @@ mod parseargs;
 mod progress;
 
 use crate::bufferedoutput::BufferedOutput;
-use blocks::conv_block_unblock_helper;
+use blocks::Converter;
 use datastructures::{ConversionMode, IConvFlags, IFlags, OConvFlags, OFlags, options};
 use parseargs::Parser;
 use progress::ProgUpdateType;
@@ -48,16 +48,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Arg, Command};
-use gcd::Gcd;
+use num_integer::Integer;
 use uucore::display::Quotable;
-use uucore::error::{FromIo, UResult};
 #[cfg(unix)]
-use uucore::error::{USimpleError, set_exit_code};
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+use uucore::error::USimpleError;
+use uucore::error::{FromIo, UResult, set_exit_code};
 use uucore::show_if_err;
 use uucore::{format_usage, show_error};
-
-const BUF_INIT_BYTE: u8 = 0xDD;
 
 /// Final settings after parsing
 #[derive(Default)]
@@ -90,7 +87,6 @@ struct Settings {
 ///
 /// When all instances are dropped the background thread will exit on the next interval.
 pub struct Alarm {
-    interval: Duration,
     trigger: Arc<AtomicU8>,
 }
 
@@ -111,7 +107,7 @@ impl Alarm {
             }
         });
 
-        Self { interval, trigger }
+        Self { trigger }
     }
 
     /// Manually trigger the alarm as a signal event
@@ -127,11 +123,6 @@ impl Alarm {
     /// by the closure returned from `manual_trigger_fn`
     pub fn get_trigger(&self) -> u8 {
         self.trigger.swap(ALARM_TRIGGER_NONE, Relaxed)
-    }
-
-    // Getter function for the configured interval duration
-    pub fn get_interval(&self) -> Duration {
-        self.interval
     }
 }
 
@@ -162,9 +153,56 @@ impl Num {
 
     fn to_bytes(self, block_size: u64) -> u64 {
         match self {
-            Self::Blocks(n) => n * block_size,
+            Self::Blocks(n) => n.saturating_mul(block_size),
             Self::Bytes(n) => n,
         }
+    }
+}
+
+/// A 4 KiB-aligned heap buffer used as `dd`'s read scratch.
+///
+/// `O_DIRECT` fails reads with `EINVAL` when the user buffer does not meet
+/// the device's DMA alignment (typically 512 bytes; 4 KiB covers every
+/// mainline Linux block driver). Over-allocates [`alloc_copy_buffer`]
+/// storage by one alignment unit and slices at the first aligned byte,
+/// keeping the pages zeroed and not faulted in.
+struct AlignedBuf {
+    storage: Vec<u8>,
+    /// Distance from the start of `storage` to the first aligned byte;
+    /// `offset + len <= storage.len()` since `storage` is over-allocated
+    /// by `ALIGNMENT`.
+    offset: usize,
+    /// Logical buffer length in bytes.
+    len: usize,
+}
+
+impl AlignedBuf {
+    const ALIGNMENT: usize = 4096;
+
+    fn new(size: usize) -> io::Result<Self> {
+        let total = size
+            .checked_add(Self::ALIGNMENT)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let storage = alloc_copy_buffer(total)?;
+        let misalignment = storage.as_ptr().addr() % Self::ALIGNMENT;
+        let offset = if misalignment == 0 {
+            0
+        } else {
+            Self::ALIGNMENT - misalignment
+        };
+        Ok(Self {
+            storage,
+            offset,
+            len: size,
+        })
+    }
+
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        &mut self.storage[self.offset..self.offset + self.len]
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.storage[self.offset..self.offset + self.len]
     }
 }
 
@@ -291,6 +329,14 @@ impl Source {
             _ => Err(rustix::io::Errno::SPIPE.into()),
         }
     }
+
+    // Not reached today: the parser accepts `nocache` only on Linux and
+    // Android, and FreeBSD builds the fadvise variant above. Kept so that
+    // every caller sees one signature.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    fn discard_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 impl Read for Source {
@@ -327,20 +373,14 @@ impl<'a> Input<'a> {
         #[cfg(windows)]
         let mut src = {
             let f = File::from(io::stdin().as_handle().try_clone_to_owned()?);
-            let is_file = if let Ok(metadata) = f.metadata() {
-                // this hack is needed as there is no other way on windows
-                // to differentiate between the case where `seek` works
-                // on a file handle or not. i.e. when the handle is no real
-                // file but a pipe, `seek` is still successful, but following
-                // `read`s are not affected by the seek.
-                metadata.creation_time() != 0
-            } else {
-                false
-            };
-            if is_file {
-                Source::File(f)
-            } else {
-                Source::Stdin(io::stdin())
+            // this hack is needed as there is no other way on windows
+            // to differentiate between the case where `seek` works
+            // on a file handle or not. i.e. when the handle is no real
+            // file but a pipe, `seek` is still successful, but following
+            // `read`s are not affected by the seek.
+            match f.metadata() {
+                Ok(metadata) if metadata.creation_time() != 0 => Source::File(f),
+                _ => Source::Stdin(io::stdin()),
             }
         };
         #[cfg(all(not(unix), not(windows)))]
@@ -462,28 +502,10 @@ impl Input<'_> {
     ///
     /// `offset` and `len` specify a contiguous portion of the input.
     /// This function informs the kernel that the specified portion of
-    /// the input file is no longer needed. If not possible, then this
-    /// function prints an error message to stderr and sets the exit
-    /// status code to 1.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", target_os = "freebsd")),
-        allow(clippy::unused_self, unused_variables)
-    )]
-    fn discard_cache(&self, offset: u64, len: u64) {
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-        {
-            let file = self
-                .settings
-                .infile
-                .clone()
-                .unwrap_or_else(|| translate!("dd-standard-input"));
-            show_if_err!(
-                self.src.discard_cache(offset, len).map_err_context(
-                    || translate!("dd-error-failed-discard-cache", "file" => file)
-                )
-            );
-        }
-        // TODO: Is there a way to discard filesystem cache on other targets?
+    /// the input file is no longer needed. If not possible, the error is
+    /// returned; the caller decides whether to report it.
+    fn discard_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.src.discard_cache(offset, len)
     }
 
     /// Fills a given buffer.
@@ -491,7 +513,7 @@ impl Input<'_> {
     /// The start of each ibs-sized read follows the previous one; a short
     /// read ends the fill, so the bytes received so far form one partial
     /// record for the copy loop (as in GNU dd).
-    fn fill_consecutive(&mut self, buf: &mut Vec<u8>) -> io::Result<ReadStat> {
+    fn fill_consecutive(&mut self, buf: &mut [u8]) -> io::Result<ReadStat> {
         let mut reads_complete = 0;
         let mut reads_partial = 0;
         let mut bytes_total = 0;
@@ -507,15 +529,15 @@ impl Input<'_> {
                     reads_partial += 1;
                     // A short read must end this fill: the next read would
                     // start at the following ibs-aligned chunk, leaving a
-                    // gap of stale bytes inside `buf` that the `truncate`
-                    // below would keep in the output while dropping the
-                    // same number of real trailing bytes (issue #13458).
+                    // gap of stale bytes inside `buf` that the caller's
+                    // `bytes_total` slice would keep in the output while
+                    // dropping the same number of real trailing bytes
+                    // (issue #13458).
                     break;
                 }
                 _ => break,
             }
         }
-        buf.truncate(bytes_total);
         Ok(ReadStat {
             reads_complete,
             reads_partial,
@@ -528,7 +550,8 @@ impl Input<'_> {
     /// Fills a given buffer.
     /// Reads in increments of 'self.ibs'.
     /// The start of each ibs-sized read is aligned to multiples of ibs; remaining space is filled with the 'pad' byte.
-    fn fill_blocks(&mut self, buf: &mut Vec<u8>, pad: u8) -> io::Result<ReadStat> {
+    /// Returns the read statistics and the total filled length (reads + padding).
+    fn fill_blocks(&mut self, buf: &mut [u8], pad: u8) -> io::Result<(ReadStat, usize)> {
         let mut reads_complete = 0;
         let mut reads_partial = 0;
         let mut base_idx = 0;
@@ -543,8 +566,7 @@ impl Input<'_> {
                 rlen if rlen < target_len => {
                     bytes_total += rlen;
                     reads_partial += 1;
-                    let padding = vec![pad; target_len - rlen];
-                    buf.splice(base_idx + rlen..next_blk, padding);
+                    buf[base_idx + rlen..next_blk].fill(pad);
                 }
                 rlen => {
                     bytes_total += rlen;
@@ -555,13 +577,15 @@ impl Input<'_> {
             base_idx += self.settings.ibs;
         }
 
-        buf.truncate(base_idx);
-        Ok(ReadStat {
-            reads_complete,
-            reads_partial,
-            records_truncated: 0,
-            bytes_total: bytes_total.try_into().unwrap(),
-        })
+        Ok((
+            ReadStat {
+                reads_complete,
+                reads_partial,
+                records_truncated: 0,
+                bytes_total: bytes_total.try_into().unwrap(),
+            },
+            base_idx,
+        ))
     }
 }
 
@@ -655,20 +679,20 @@ impl Dest {
         }
     }
 
-    /// Truncate the underlying file to the current stream position, if possible.
-    fn truncate(&mut self) -> io::Result<()> {
-        let Self::File(f, _) = self else {
+    /// Grow a sparse output file up to the current stream position, since
+    /// `conv=sparse` seeks over trailing zero blocks. Never shrinks it.
+    fn extend_sparse(&mut self) -> io::Result<()> {
+        let Self::File(f, Density::Sparse) = self else {
             return Ok(());
         };
+        let meta = f.metadata()?;
+        // `set_len()` fails on special outputs such as `/dev/null`.
+        if !meta.is_file() {
+            return Ok(());
+        }
         let pos = f.stream_position()?;
-        // `set_len()` can fail with EINVAL on special outputs such as
-        // `/dev/null`; GNU ignores that. But on a regular file a
-        // truncate failure (e.g. ENOSPC, read-only fs) means silent data
-        // loss.
-        if let Err(e) = f.set_len(pos)
-            && f.metadata().is_ok_and(|m| m.file_type().is_file())
-        {
-            return Err(e);
+        if meta.len() < pos {
+            f.set_len(pos)?;
         }
         Ok(())
     }
@@ -691,6 +715,14 @@ impl Dest {
             _ => Err(rustix::io::Errno::SPIPE.into()),
         }
     }
+
+    // Not reached today: the parser accepts `nocache` only on Linux and
+    // Android, and FreeBSD builds the fadvise variant above. Kept so that
+    // every caller sees one signature.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+    fn discard_cache(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Decide whether the given buffer is all zeros.
@@ -698,8 +730,8 @@ fn is_sparse(buf: &[u8]) -> bool {
     buf.iter().all(|&e| e == 0u8)
 }
 
-/// Handle O_DIRECT write errors by temporarily removing the flag and retrying.
-/// This follows GNU dd behavior for partial block writes with O_DIRECT.
+/// Handle `O_DIRECT` write errors by temporarily removing the flag and retrying.
+/// This follows GNU dd behavior for partial block writes with `O_DIRECT`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn handle_o_direct_write(f: &mut File, buf: &[u8], original_error: io::Error) -> io::Result<usize> {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
@@ -834,16 +866,20 @@ impl<'a> Output<'a> {
             || translate!("dd-error-failed-to-open", "path" => filename.quote()),
         )?;
 
-        // Seek to the index in the output file, truncating if requested.
-        //
-        // Calling `set_len()` may result in an error (for example,
-        // when calling it on `/dev/null`), but we don't want to
-        // terminate the process when that happens.  Instead, we
-        // suppress the error by calling `Result::ok()`. This matches
-        // the behavior of GNU `dd` when given the command-line
-        // argument `of=/dev/null`.
-        if !settings.oconv.notrunc {
-            dst.set_len(settings.seek).ok();
+        // Failures on special outputs such as `/dev/null` are ignored, as GNU does.
+        if !settings.oconv.notrunc
+            && let Err(e) = dst.set_len(settings.seek)
+            && dst.metadata().is_ok_and(|m| m.is_file())
+        {
+            show_error!(
+                "{}",
+                e.map_err_context(|| translate!(
+                    "dd-error-failed-to-truncate",
+                    "size" => settings.seek,
+                    "file" => filename.quote()
+                ))
+            );
+            set_exit_code(1);
         }
 
         Self::prepare_file(dst, settings)
@@ -856,8 +892,10 @@ impl<'a> Output<'a> {
             Density::Dense
         };
         let mut dst = Dest::File(dst, density);
-        dst.seek(settings.seek, settings.obs)
-            .map_err_context(|| translate!("dd-error-failed-to-seek"))?;
+        if settings.seek > 0 {
+            dst.seek(settings.seek, settings.obs)
+                .map_err_context(|| translate!("dd-error-failed-to-seek"))?;
+        }
         Ok(Self { dst, settings })
     }
 
@@ -913,28 +951,10 @@ impl<'a> Output<'a> {
     ///
     /// `offset` and `len` specify a contiguous portion of the output.
     /// This function informs the kernel that the specified portion of
-    /// the output file is no longer needed. If not possible, then
-    /// this function prints an error message to stderr and sets the
-    /// exit status code to 1.
-    #[cfg_attr(
-        not(any(target_os = "linux", target_os = "android", target_os = "freebsd")),
-        allow(clippy::unused_self, unused_variables)
-    )]
-    fn discard_cache(&self, offset: u64, len: u64) {
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-        {
-            let file = self
-                .settings
-                .outfile
-                .clone()
-                .unwrap_or_else(|| translate!("dd-standard-output"));
-            show_if_err!(
-                self.dst.discard_cache(offset, len).map_err_context(
-                    || translate!("dd-error-failed-discard-cache", "file" => file)
-                )
-            );
-        }
-        // TODO Is there a way to discard filesystem cache on other targets?
+    /// the output file is no longer needed. If not possible, the error is
+    /// returned; the caller decides whether to report it.
+    fn discard_cache(&self, offset: u64, len: u64) -> io::Result<()> {
+        self.dst.discard_cache(offset, len)
     }
 
     /// writes a block of data. optionally retries when first try didn't complete
@@ -1002,9 +1022,9 @@ impl<'a> Output<'a> {
         }
     }
 
-    /// Truncate the underlying file to the current stream position, if possible.
-    fn truncate(&mut self) -> io::Result<()> {
-        self.dst.truncate()
+    /// Grow a sparse output file up to the current stream position.
+    fn extend_sparse(&mut self) -> io::Result<()> {
+        self.dst.extend_sparse()
     }
 }
 
@@ -1022,7 +1042,7 @@ enum BlockWriter<'a> {
 }
 
 impl BlockWriter<'_> {
-    fn discard_cache(&self, offset: u64, len: u64) {
+    fn discard_cache(&self, offset: u64, len: u64) -> io::Result<()> {
         match self {
             Self::Unbuffered(o) => o.discard_cache(offset, len),
             Self::Buffered(o) => o.discard_cache(offset, len),
@@ -1043,18 +1063,20 @@ impl BlockWriter<'_> {
         }
     }
 
-    /// Truncate the file to the final cursor location.
+    /// Grow a sparse output file up to the final cursor location.
     ///
     /// Errors are suppressed for special outputs (e.g. `/dev/null`) but
-    /// propagated for regular files, so a failed truncate does not silently
-    /// leave stale data behind. See [`Dest::truncate`].
-    fn truncate(&mut self) -> io::Result<()> {
+    /// propagated for regular files. See [`Dest::extend_sparse`].
+    fn extend_sparse(&mut self) -> io::Result<()> {
         match self {
-            Self::Unbuffered(o) => o.truncate(),
-            Self::Buffered(o) => o.truncate(),
+            Self::Unbuffered(o) => o.extend_sparse(),
+            Self::Buffered(o) => o.extend_sparse(),
         }
     }
 
+    // Also called by the converter's writer, which would otherwise stop it
+    // from being inlined in the copy loop.
+    #[inline]
     fn write_blocks(&mut self, buf: &[u8]) -> io::Result<WriteStat> {
         match self {
             Self::Unbuffered(o) => o.write_blocks(buf),
@@ -1068,10 +1090,26 @@ impl BlockWriter<'_> {
 fn flush_caches_full_length(i: &Input, o: &Output) {
     // Using len=0 in posix_fadvise means "to end of file"
     if i.settings.iflags.nocache {
-        i.discard_cache(0, 0);
+        let file = i
+            .settings
+            .infile
+            .clone()
+            .unwrap_or_else(|| translate!("dd-standard-input"));
+        show_if_err!(
+            i.discard_cache(0, 0)
+                .map_err_context(|| translate!("dd-error-failed-discard-cache", "file" => file))
+        );
     }
     if i.settings.oflags.nocache {
-        o.discard_cache(0, 0);
+        let file = o
+            .settings
+            .outfile
+            .clone()
+            .unwrap_or_else(|| translate!("dd-standard-output"));
+        show_if_err!(
+            o.discard_cache(0, 0)
+                .map_err_context(|| translate!("dd-error-failed-discard-cache", "file" => file))
+        );
     }
 }
 
@@ -1123,9 +1161,6 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
     let (prog_tx, rx) = mpsc::channel();
     let output_thread = thread::spawn(gen_prog_updater(rx, i.settings.status));
 
-    // Whether to truncate the output file after all blocks have been written.
-    let truncate = !o.settings.oconv.notrunc;
-
     // Optimization: if no blocks are to be written, then don't
     // bother allocating any buffers.
     if let Some(Num::Blocks(0) | Num::Bytes(0)) = i.settings.count {
@@ -1142,7 +1177,6 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
             start,
             &prog_tx,
             output_thread,
-            truncate,
         );
     }
 
@@ -1181,10 +1215,17 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
         BlockWriter::Unbuffered(o)
     };
 
-    // Create a common empty buffer with a capacity of the block size.
-    // This is the max size needed.
-    let mut buf = Vec::new();
-    buf.try_reserve(bsize)?; // try_with_capacity is unstable https://github.com/rust-lang/rust/issues/91913
+    // Aligned read scratch sized to the block size (the max size needed).
+    // 4 KiB alignment satisfies block devices that enforce a strict
+    // `dma_alignment` for `iflag=direct` reads — see `AlignedBuf`.
+    let mut buf = AlignedBuf::new(bsize)?;
+    // Applies the `conv=` flags not handled by `read_helper`.
+    let mut converter = i.settings.iconv.mode.map(Converter::new);
+    // The records truncated by `converter`, copied into `rstat` for progress
+    // reports: plain copies are faster when nothing borrows `rstat`.
+    let mut conv_rstat = ReadStat::default();
+    // What `converter` wrote before a write error, added to `wstat` after the loop.
+    let mut conv_wstat = WriteStat::default();
 
     // The main read/write loop.
     //
@@ -1201,21 +1242,28 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
         // best buffer size for reading based on the number of
         // blocks already read and the number of blocks remaining.
         let loop_bsize = calc_loop_bsize(i.settings.count, &rstat, i.settings.ibs, bsize);
-        let Ok(rstat_update) =
+        let Ok((rstat_update, data)) =
             read_helper(&mut i, &mut buf, loop_bsize).map_err(|e| copy_error = Some(e))
         else {
             break;
         };
         if rstat_update.is_empty() {
+            // Dropping the cache is best-effort: a failure (a pipe cannot
+            // drop its cache at all) must not fail or diagnose a copy that
+            // succeeded. Only the `count=0` path reports it.
             if input_nocache {
-                i.discard_cache(read_offset, 0);
+                let _ = i.discard_cache(read_offset, 0);
             }
             if output_nocache || output_direct {
-                o.discard_cache(write_offset.try_into().unwrap(), 0);
+                let _ = o.discard_cache(write_offset.try_into().unwrap(), 0);
             }
             break;
         }
-        let Ok(wstat_update) = o.write_blocks(&buf).map_err(|e| copy_error = Some(e)) else {
+        let written = match &mut converter {
+            None => o.write_blocks(data),
+            Some(c) => write_converted(c, data, &mut conv_rstat, &mut conv_wstat, &mut o),
+        };
+        let Ok(wstat_update) = written.map_err(|e| copy_error = Some(e)) else {
             break;
         };
 
@@ -1227,7 +1275,7 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
         if input_nocache {
             let offset = read_offset;
             let len = read_len;
-            i.discard_cache(offset, len);
+            let _ = i.discard_cache(offset, len);
         }
         read_offset += read_len;
 
@@ -1239,7 +1287,7 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
         if output_nocache {
             let offset = write_offset.try_into().unwrap();
             let len = write_len.try_into().unwrap();
-            o.discard_cache(offset, len);
+            let _ = o.discard_cache(offset, len);
         }
         write_offset += write_len;
 
@@ -1260,10 +1308,21 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
             ALARM_TRIGGER_SIGNAL => ProgUpdateType::Signal,
             _ => continue,
         };
+        rstat.records_truncated = conv_rstat.records_truncated;
         let prog_update = ProgUpdate::new(rstat, wstat, start.elapsed(), tp);
         prog_tx.send(prog_update).unwrap_or(());
     }
 
+    wstat += conv_wstat;
+    // The input may end in the middle of a `conv=block` record.
+    if copy_error.is_none()
+        && let Some(c) = &mut converter
+        && let Err(e) = c.finish(&mut write_to(&mut o, &mut wstat))
+    {
+        copy_error = Some(e);
+    }
+
+    rstat.records_truncated = conv_rstat.records_truncated;
     if let Some(e) = copy_error {
         // Flushing and syncing are pointless now, but the caller still wants the statistics.
         let prog_update = ProgUpdate::new(rstat, wstat, start.elapsed(), ProgUpdateType::Final);
@@ -1274,7 +1333,41 @@ fn dd_copy(mut i: Input, o: Output) -> io::Result<()> {
         return Err(e);
     }
 
-    finalize(o, rstat, wstat, start, &prog_tx, output_thread, truncate)
+    finalize(o, rstat, wstat, start, &prog_tx, output_thread)
+}
+
+/// Write `data` through `converter`, which may count truncated records in `rstat`.
+///
+/// On error, the pieces already written are counted in `failed_wstat`.
+/// Kept out of the copy loop, which is faster for plain copies.
+#[inline(never)]
+fn write_converted(
+    converter: &mut Converter,
+    data: &[u8],
+    rstat: &mut ReadStat,
+    failed_wstat: &mut WriteStat,
+    o: &mut BlockWriter,
+) -> io::Result<WriteStat> {
+    let mut wstat = WriteStat::default();
+    let result = converter.convert(data, rstat, &mut write_to(o, &mut wstat));
+    match result {
+        Ok(()) => Ok(wstat),
+        Err(e) => {
+            *failed_wstat = wstat;
+            Err(e)
+        }
+    }
+}
+
+/// The writer given to the converter: write each piece to `o` and count it in `wstat`.
+fn write_to<'a>(
+    o: &'a mut BlockWriter,
+    wstat: &'a mut WriteStat,
+) -> impl FnMut(&[u8]) -> io::Result<()> + 'a {
+    |buf| {
+        *wstat += o.write_blocks(buf)?;
+        Ok(())
+    }
 }
 
 /// Flush output, print final stats, and join with the progress thread.
@@ -1285,7 +1378,6 @@ fn finalize<T>(
     start: Instant,
     prog_tx: &mpsc::Sender<ProgUpdate>,
     output_thread: thread::JoinHandle<T>,
-    truncate: bool,
 ) -> io::Result<()> {
     // Flush the output in case a partial write has been buffered but
     // not yet written.
@@ -1294,10 +1386,8 @@ fn finalize<T>(
     // Sync the output, if configured to do so.
     output.sync()?;
 
-    // Truncate the file to the final cursor location.
-    if truncate {
-        output.truncate()?;
-    }
+    // With `conv=sparse`, trailing zero blocks were skipped, not written.
+    output.extend_sparse()?;
 
     // Print the final read/write statistics.
     let wstat = wstat + wstat_update;
@@ -1348,46 +1438,61 @@ fn make_linux_oflags(oflags: &OFlags) -> Option<core::ffi::c_int> {
     if flag == 0 { None } else { Some(flag) }
 }
 
-/// Read from an input (that is, a source of bytes) into the given buffer.
+/// The copy buffer, `bsize` bytes long and ready to be read into.
 ///
-/// This function also performs any conversions as specified by
-/// `conv=swab` or `conv=block` command-line arguments. This function
-/// mutates the `buf` argument in-place. The returned [`ReadStat`]
-/// indicates how many blocks were read.
-fn read_helper(i: &mut Input, buf: &mut Vec<u8>, bsize: usize) -> io::Result<ReadStat> {
-    // Local Helper Fns -------------------------------------------------
+/// `Read::read` fills an initialized slice, and zeroed pages are the only
+/// initialization that costs nothing: `vec![0; n]` allocates through
+/// `alloc_zeroed`, so the pages arrive from the kernel already zero and stay
+/// untouched until something is read into them. Writing a fill byte over
+/// reserved capacity instead faults in the whole of `bs=` before the first
+/// read, which is what made a large `bs=` cost its full size in time and in
+/// resident memory even with nothing to copy.
+///
+/// The reservation still happens first, because `vec![0; n]` aborts when the
+/// allocation fails and `dd` reports that as an error instead.
+fn alloc_copy_buffer(bsize: usize) -> io::Result<Vec<u8>> {
+    let mut probe: Vec<u8> = Vec::new();
+    // try_with_capacity is unstable https://github.com/rust-lang/rust/issues/91913
+    probe.try_reserve(bsize)?;
+    drop(probe);
+    Ok(vec![0u8; bsize])
+}
+
+/// Read one block worth of data, applying `conv=sync` and `conv=swab`.
+///
+/// `read_buf` is the page-aligned scratch read into directly. The other
+/// `conv=` transformations are applied by [`Converter`].
+fn read_helper<'a>(
+    i: &mut Input,
+    read_buf: &'a mut AlignedBuf,
+    bsize: usize,
+) -> io::Result<(ReadStat, &'a [u8])> {
     fn perform_swab(buf: &mut [u8]) {
         for base in (1..buf.len()).step_by(2) {
             buf.swap(base, base - 1);
         }
     }
-    // ------------------------------------------------------------------
-    // Read
-    // Resize the buffer to the bsize. Any garbage data in the buffer is overwritten or truncated, so there is no need to fill with BUF_INIT_BYTE first.
-    // resizing buf cause serious performance drop https://github.com/uutils/coreutils/issues/11544
-    buf.resize(bsize, BUF_INIT_BYTE);
 
-    let mut rstat = match i.settings.iconv.sync {
-        Some(ch) => i.fill_blocks(buf, ch)?,
-        _ => i.fill_consecutive(buf)?,
-    };
-    // Return early if no data
-    if rstat.reads_complete == 0 && rstat.reads_partial == 0 {
-        return Ok(rstat);
-    }
-
-    // Perform any conv=x[,x...] options
-    if i.settings.iconv.swab {
-        perform_swab(buf);
-    }
-
-    match i.settings.iconv.mode {
-        Some(ref mode) => {
-            *buf = conv_block_unblock_helper(buf.clone(), mode, &mut rstat);
-            Ok(rstat)
+    let (rstat, data_len) = {
+        let scratch = &mut read_buf.as_mut_bytes()[..bsize];
+        let (rstat, data_len) = if let Some(ch) = i.settings.iconv.sync {
+            i.fill_blocks(scratch, ch)?
+        } else {
+            let s = i.fill_consecutive(scratch)?;
+            let n = s.bytes_total as usize;
+            (s, n)
+        };
+        if !rstat.is_empty() && i.settings.iconv.swab {
+            perform_swab(&mut scratch[..data_len]);
         }
-        None => Ok(rstat),
+        (rstat, data_len)
+    };
+
+    if rstat.is_empty() {
+        return Ok((rstat, &[]));
     }
+
+    Ok((rstat, &read_buf.as_bytes()[..data_len]))
 }
 
 // Calculate a 'good' internal buffer size.
@@ -1397,7 +1502,7 @@ fn read_helper(i: &mut Input, buf: &mut Vec<u8>, bsize: usize) -> io::Result<Rea
 // the least common multiple is a good representation of these interests.
 // https://en.wikipedia.org/wiki/Least_common_multiple#Using_the_greatest_common_divisor
 fn calc_bsize(ibs: usize, obs: usize) -> usize {
-    let gcd = Gcd::gcd(ibs, obs);
+    let gcd = ibs.gcd(&obs);
     // calculate the lcm from gcd; saturate so an oversized product fails at
     // allocation instead of panicking here
     (ibs / gcd).saturating_mul(obs)
@@ -1495,8 +1600,11 @@ fn is_fifo(filename: &str) -> bool {
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // The command line is kept for the caret in operand diagnostics.
-    let (matches, diag_args) =
-        uucore::clap_localization::handle_clap_result_with_diagnostics(uu_app(), args.collect())?;
+    let (matches, diag_args) = uucore::clap_localization::handle_clap_result_with_diagnostics(
+        uu_app(),
+        args.collect(),
+        1,
+    )?;
 
     let settings: Settings = Parser::new().parse_with_diagnostics(
         matches
@@ -1505,7 +1613,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         diag_args.as_deref(),
     )?;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
     if uucore::signals::stderr_was_closed() && settings.status != Some(StatusLevel::None) {
         return Err(USimpleError::new(1, "write error"));
     }
@@ -1613,14 +1721,15 @@ mod tests {
         assert_eq!(res, m);
     }
 
-    // a failed truncate on a regular file must surface as an
-    // error instead of being silently swallowed (which would hide data loss).
+    // a failed extension of a regular file must surface as an
+    // error instead of being silently swallowed (which would leave the
+    // output shorter than the data copied).
     #[cfg(unix)]
     #[test]
-    fn truncate_propagates_error_on_regular_file() {
+    fn extend_sparse_propagates_error_on_regular_file() {
         use crate::{Density, Dest};
         use std::fs::OpenOptions;
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("regular");
@@ -1629,23 +1738,25 @@ mod tests {
             .write_all(b"hello world")
             .unwrap();
 
-        // Open read-only so `set_len()` fails with EINVAL on a regular file.
-        let f = OpenOptions::new().read(true).open(&path).unwrap();
-        let mut dst = Dest::File(f, Density::Dense);
-        assert!(dst.truncate().is_err());
+        // Open read-only so `set_len()` fails with EINVAL on a regular file,
+        // and seek past the end so there is something to extend.
+        let mut f = OpenOptions::new().read(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(64)).unwrap();
+        let mut dst = Dest::File(f, Density::Sparse);
+        assert!(dst.extend_sparse().is_err());
     }
 
-    // truncate failures on special outputs (e.g. `/dev/null`)
+    // failures on special outputs (e.g. `/dev/null`)
     // are still suppressed, matching GNU `dd of=/dev/null`.
     #[cfg(unix)]
     #[test]
-    fn truncate_suppresses_error_on_special_file() {
+    fn extend_sparse_suppresses_error_on_special_file() {
         use crate::{Density, Dest};
         use std::fs::OpenOptions;
 
         let f = OpenOptions::new().write(true).open("/dev/null").unwrap();
-        let mut dst = Dest::File(f, Density::Dense);
-        assert!(dst.truncate().is_ok());
+        let mut dst = Dest::File(f, Density::Sparse);
+        assert!(dst.extend_sparse().is_ok());
     }
 
     #[test]
@@ -1672,5 +1783,27 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_aligned_buf_is_aligned_and_sized() {
+        use crate::AlignedBuf;
+
+        // Sizes around and away from the 4096 chunk boundary.
+        for size in [1, 511, 4096, 4097, 65536, (1 << 20) + 13] {
+            let mut buf = AlignedBuf::new(size).unwrap();
+            assert_eq!(buf.as_bytes().len(), size);
+            assert_eq!(buf.as_mut_bytes().len(), size);
+            // The alignment `O_DIRECT` reads rely on.
+            assert_eq!(buf.as_bytes().as_ptr().addr() % 4096, 0);
+        }
+    }
+
+    #[test]
+    fn test_aligned_buf_zero_size() {
+        use crate::AlignedBuf;
+
+        let buf = AlignedBuf::new(0).unwrap();
+        assert!(buf.as_bytes().is_empty());
     }
 }

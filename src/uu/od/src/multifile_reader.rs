@@ -2,8 +2,10 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore (ToDO) multifile curr fnames fname xfrd fillloop mockstream
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 #[cfg(unix)]
@@ -15,7 +17,7 @@ use uucore::{display::Quotable, error::strip_errno, show_error, translate};
 const SKIP_BUFFER_SIZE: usize = 16 * 1024;
 
 pub enum InputSource<'a> {
-    FileName(&'a str),
+    FileName(&'a OsStr),
     Stdin,
 }
 
@@ -54,7 +56,7 @@ pub struct MultifileReader<'a> {
     ni: Vec<InputSource<'a>>,
     curr_file: Option<CurrentReader>,
     any_err: bool,
-    file_name: Option<&'a str>,
+    file_name: Option<&'a OsStr>,
 }
 
 pub trait HasError {
@@ -118,7 +120,7 @@ impl MultifileReader<'_> {
                             // print an error at the time that the file is needed,
                             // then move to the next file
                             let error_msg = match e.kind() {
-                                #[cfg(target_os = "windows")]
+                                #[cfg(windows)]
                                 io::ErrorKind::NotFound => "No such file or directory",
                                 _ => &strip_errno(&e),
                             };
@@ -237,7 +239,10 @@ impl io::Read for MultifileReader<'_> {
                             Err(e) => {
                                 show_error!(
                                     "{}: {}",
-                                    self.file_name.unwrap_or("I/O"),
+                                    self.file_name
+                                        .unwrap_or(OsStr::new("I/O"))
+                                        .maybe_quote()
+                                        .external(true),
                                     strip_errno(&e)
                                 );
                                 self.any_err = true;
@@ -274,11 +279,11 @@ mod tests {
     fn test_multi_file_reader_one_read() {
         let mut file1 = NamedTempFile::new().unwrap();
         file1.write_all(b"abcd").unwrap();
-        let path1 = file1.path().to_str().unwrap();
+        let path1 = file1.path().as_os_str();
 
         let mut file2 = NamedTempFile::new().unwrap();
         file2.write_all(b"ABCD").unwrap();
-        let path2 = file2.path().to_str().unwrap();
+        let path2 = file2.path().as_os_str();
 
         let inputs = vec![InputSource::FileName(path1), InputSource::FileName(path2)];
         let mut v = [0; 10];
@@ -294,11 +299,11 @@ mod tests {
     fn test_multi_file_reader_two_reads() {
         let mut file1 = NamedTempFile::new().unwrap();
         file1.write_all(b"abcd").unwrap();
-        let path1 = file1.path().to_str().unwrap();
+        let path1 = file1.path().as_os_str();
 
         let mut file2 = NamedTempFile::new().unwrap();
         file2.write_all(b"ABCD").unwrap();
-        let path2 = file2.path().to_str().unwrap();
+        let path2 = file2.path().as_os_str();
 
         let inputs = vec![InputSource::FileName(path1), InputSource::FileName(path2)];
         let mut v = [0; 5];

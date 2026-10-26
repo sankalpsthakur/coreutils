@@ -2,7 +2,7 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-//
+
 #[cfg(unix)]
 use uutests::at_and_ucmd;
 use uutests::new_ucmd;
@@ -89,7 +89,7 @@ fn test_garbage() {
         .arg("-d")
         .pipe_in(input)
         .fails()
-        .stderr_only("base32: error: invalid input\n");
+        .stderr_only("base32: invalid input\n");
 }
 
 #[test]

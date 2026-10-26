@@ -2,6 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
+// spell-checker:ignore backupopt
+
 //! Implement GNU-style backup functionality.
 //!
 //! This module implements the backup functionality as described in the [GNU
@@ -79,8 +82,6 @@
 //! }
 //! ```
 
-// spell-checker:ignore backupopt
-
 use crate::{
     display::Quotable,
     error::{UError, UResult},
@@ -149,25 +150,11 @@ pub enum BackupError {
     /// parameter is the argument, second is the arguments origin (CLI or
     /// ENV-var)
     AmbiguousArgument(String, String),
-    /// Currently unused
-    BackupImpossible(),
-    // BackupFailed(PathBuf, PathBuf, std::io::Error),
 }
 
 impl UError for BackupError {
-    fn code(&self) -> i32 {
-        match self {
-            Self::BackupImpossible() => 2,
-            _ => 1,
-        }
-    }
-
     fn usage(&self) -> bool {
-        // Suggested by clippy.
-        matches!(
-            self,
-            Self::InvalidArgument(_, _) | Self::AmbiguousArgument(_, _)
-        )
+        true
     }
 }
 
@@ -186,12 +173,6 @@ impl Display for BackupError {
                 "ambiguous argument {} for '{origin}'\n{VALID_ARGS_HELP}",
                 arg.quote(),
             ),
-            Self::BackupImpossible() => write!(f, "cannot create backup"),
-            // Placeholder for later
-            // Self::BackupFailed(from, to, e) => Display::fmt(
-            //     &uio_error!(e, "failed to backup {} to {}", from.quote(), to.quote()),
-            //     f
-            // ),
         }
     }
 }
@@ -245,7 +226,7 @@ pub mod arguments {
 /// In order of precedence, this function obtains the backup suffix
 ///
 /// 1. From the '-S' or '--suffix' CLI argument, if present
-/// 2. From the "SIMPLE_BACKUP_SUFFIX" environment variable, if present
+/// 2. From the `SIMPLE_BACKUP_SUFFIX` environment variable, if present
 /// 3. By using the default '~' if none of the others apply, or if they are empty or contain slashes
 ///
 /// This function directly takes [`ArgMatches`] as argument and looks for
