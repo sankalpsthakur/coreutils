@@ -2,12 +2,14 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-// spell-checker:ignore (words) agroupthatdoesntexist auserthatdoesntexist cuuser groupname notexisting passgrp
+
+// spell-checker:ignore (words) agroupthatdoesntexist auserthatdoesntexist groupname notexisting passgrp
+
 #[cfg(all(unix, not(target_os = "openbsd")))]
 use std::os::unix::fs::MetadataExt;
 use uutests::util::{CmdResult, TestScenario, is_ci, run_ucmd_as_root};
-use uutests::util_name;
-use uutests::{at_and_ucmd, new_ucmd};
+use uutests::{at_and_ucmd, new_ucmd, util_name};
+
 // Apparently some CI environments have configuration issues, e.g. with 'whoami' and 'id'.
 // If we are running inside the CI and "needle" is in "stderr" skipping this test is
 // considered okay. If we are not inside the CI this calls assert!(result.success).
@@ -35,9 +37,9 @@ fn skipping_test_is_okay(result: &CmdResult, needle: &str) -> bool {
     false
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
 const ROOT_GROUP: &str = "root";
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 const ROOT_GROUP: &str = "wheel";
 
 #[cfg(test)]
@@ -132,16 +134,25 @@ fn test_chown_only_owner_colon() {
     let user_name = String::from(result.stdout_str().trim());
     assert!(!user_name.is_empty());
 
+    let result = scene.cmd("id").arg("-gn").run();
+    if skipping_test_is_okay(&result, "id: cannot find name for group ID") {
+        return;
+    }
+    let login_group_name = String::from(result.stdout_str().trim());
+    let expected = format!("{user_name}:{login_group_name}");
+
     let file1 = "test_chown_file1";
     at.touch(file1);
 
+    // "username:" sets the owner and the owner's login group; the
+    // ownership is "retained" only if the group already matches.
     scene
         .ucmd()
         .arg(format!("{user_name}:"))
         .arg("--verbose")
         .arg(file1)
         .succeeds()
-        .stdout_contains("retained as")
+        .stdout_contains(&expected)
         .no_stderr();
 
     scene
@@ -150,7 +161,7 @@ fn test_chown_only_owner_colon() {
         .arg("--verbose")
         .arg(file1)
         .succeeds()
-        .stdout_contains("retained as")
+        .stdout_contains(&expected)
         .stderr_contains("warning: '.' should be ':'");
 
     scene
@@ -160,6 +171,63 @@ fn test_chown_only_owner_colon() {
         .arg(file1)
         .fails()
         .stderr_contains("failed to change");
+}
+
+/// Test that `chown USER:` sets the group to USER's login group.
+#[test]
+#[cfg(all(unix, not(target_os = "openbsd")))]
+fn test_chown_login_group() {
+    use chown::entries::usr2gid;
+
+    let ts = TestScenario::new(util_name!());
+    let at = &ts.fixtures;
+    let file1 = "test_chown_login_group";
+    at.touch(file1);
+
+    let Ok(root_gid) = usr2gid("root") else {
+        print!("Test skipped; no root user");
+        return;
+    };
+    let other_gid = root_gid.wrapping_add(1).to_string();
+
+    // Move the file's group out of root's login group. Changing the
+    // ownership to root requires root privileges.
+    let Ok(result) = run_ucmd_as_root(&ts, &[&format!("0:{other_gid}"), file1]) else {
+        print!("Test skipped; requires root user");
+        return;
+    };
+    result.success().no_output();
+
+    // "root:" must set the group back to root's login group.
+    let Ok(result) = run_ucmd_as_root(&ts, &["root:", file1]) else {
+        print!("Test skipped; requires root user");
+        return;
+    };
+    result.success().no_output();
+
+    assert_eq!(at.metadata(file1).gid(), root_gid);
+}
+
+/// Test that an owner whose login group cannot be resolved is an invalid spec.
+#[test]
+fn test_chown_invalid_spec() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.touch("f");
+
+    scene
+        .ucmd()
+        .arg("auserthatdoesntexist:")
+        .arg("f")
+        .fails()
+        .stderr_contains("chown: invalid spec: 'auserthatdoesntexist:'");
+
+    scene
+        .ucmd()
+        .arg("12345:")
+        .arg("f")
+        .fails()
+        .stderr_contains("chown: invalid spec: '12345:'");
 }
 
 #[test]
@@ -560,7 +628,7 @@ fn test_chown_only_group_id() {
 
     // Apparently on CI "macos-latest, x86_64-apple-darwin, feat_os_unix"
     // the process has the rights to change from runner:staff to runner:wheel
-    #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+    #[cfg(any(windows, all(unix, not(target_vendor = "apple"))))]
     // FreeBSD user on CI is part of wheel group
     if group_id != "0" {
         scene
@@ -904,6 +972,26 @@ fn test_chown_reference_file() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn test_chown_reference_file_with_non_utf8_path() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("file");
+
+    let reference = std::ffi::OsStr::from_bytes(b"reference_\xFF\xFE");
+    std::fs::File::create(at.plus(reference)).unwrap();
+
+    ucmd.arg("--verbose")
+        .arg("--reference")
+        .arg(reference)
+        .arg("file")
+        .succeeds()
+        .stdout_contains("ownership of 'file' retained as")
+        .no_stderr();
+}
+
+#[test]
 #[cfg(all(unix, not(target_os = "openbsd")))]
 fn test_chown_no_dereference_symlink_to_dir() {
     let scene = TestScenario::new(util_name!());
@@ -924,6 +1012,10 @@ fn test_chown_no_dereference_symlink_to_dir() {
 
     let dir_meta_before = std::fs::metadata(at.plus("dir")).unwrap();
     let dir_ctime_before = (dir_meta_before.ctime(), dir_meta_before.ctime_nsec());
+
+    // Let the file system clock move past the link's ctime. On some systems,
+    // such as the Android emulator, it advances in coarse steps.
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     scene
         .ucmd()
@@ -965,7 +1057,7 @@ fn test_chown_symlink_cycles() {
 
     let result = scene.ucmd().arg("-vRL").arg(&user_name).arg("a").run();
 
-    if cfg!(target_os = "macos") || cfg!(target_os = "openbsd") || cfg!(target_os = "android") {
+    if cfg!(target_vendor = "apple") || cfg!(target_os = "openbsd") || cfg!(target_os = "android") {
         result
             .stdout_contains(format!("ownership of 'a' retained as {user_name}"))
             .stdout_contains(format!("ownership of 'a/b' retained as {user_name}"))
@@ -1008,7 +1100,7 @@ fn test_chown_symlink_two_links_same_dir() {
     let user_name = String::from(result.stdout_str().trim());
     assert!(!user_name.is_empty());
 
-    // cSpell:disable
+    // spell-checker:disable
     at.mkdir_all("base/realdir");
     at.touch("base/realdir/file");
     at.symlink_dir("base/realdir", "base/link1");
@@ -1031,14 +1123,14 @@ fn test_chown_symlink_two_links_same_dir() {
                 "ownership of 'base/link2/file' retained as {user_name}"
             ));
     }
-    // cSpell:enable
+    // spell-checker:enable
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn verbose_missing_file_write_error_is_reported_not_panic() {
+    use rustix::process::geteuid;
     use std::fs::OpenOptions;
-    use uucore::process::geteuid;
 
     let dev_full = OpenOptions::new().write(true).open("/dev/full").unwrap();
     new_ucmd!()
@@ -1048,4 +1140,31 @@ fn verbose_missing_file_write_error_is_reported_not_panic() {
         .set_stdout(dev_full)
         .fails_with_code(1)
         .stderr_contains("chown: write error: No space left on device");
+}
+
+#[test]
+fn test_repeated_flags_are_accepted() {
+    use rustix::process::geteuid;
+
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir("dir");
+    at.touch("dir/file");
+
+    // GNU chown accepts a flag given more than once; the last one wins.
+    for flags in [
+        vec!["-R", "-R"],
+        vec!["-R", "--recursive"],
+        vec!["-v", "-v"],
+        vec!["-c", "-c"],
+        vec!["-f", "-f"],
+        vec!["-R", "-c", "-c"],
+    ] {
+        scene
+            .ucmd()
+            .args(&flags)
+            .arg(geteuid().to_string())
+            .arg("dir")
+            .succeeds();
+    }
 }

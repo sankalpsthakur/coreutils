@@ -51,10 +51,10 @@ crates is as follows:
 - `locales/en-US.ftl`: the util's strings
 - `locales/fr-FR.ftl`: French translation of the util's strings
 
-We have separated repositories for crates that we maintain but also publish for
+We have separate repositories for crates that we maintain but also publish for
 use by others:
 
-- [coreutils-i10n](https://github.com/uutils/coreutils-l10n)
+- [coreutils-l10n](https://github.com/uutils/coreutils-l10n)
 - [num-prime](https://github.com/uutils/num-prime)
 - [uutils-term-grid](https://github.com/uutils/uutils-term-grid)
 - [parse_datetime](https://github.com/uutils/parse_datetime)
@@ -91,7 +91,7 @@ report. A few caveats:
 
 - The package is PATCHED, so it may differ from upstream.
 - NEVER install this package on your system — it isn't meant for daily use.
-  Instead, manually download and extract the [tarball](https://launchpad.net/~bamf0/+archive/ubuntu/coreutils-reference/+files/gnu-coreutils_9.11-0ubuntu1~ppa3_amd64.deb)
+  Instead, manually download and extract the [tarball](https://launchpad.net/~bamf0/+archive/ubuntu/coreutils-reference/+files/gnu-coreutils_9.12-0ubuntu1~ppa1_amd64.deb)
   and run it from there.
 - Bug reports and fixes for this package itself are not accepted here.
 

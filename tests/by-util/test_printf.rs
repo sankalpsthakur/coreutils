@@ -4,14 +4,97 @@
 // file that was distributed with this source code.
 
 // spell-checker:ignore fffffffffffffffc DFFF
+
+use rstest::rstest;
 use uutests::new_ucmd;
 
-#[test]
-fn basic_literal() {
-    new_ucmd!()
-        .args(&["hello world"])
-        .succeeds()
-        .stdout_only("hello world");
+#[rstest]
+#[case::basic_literal(&["hello world"], "hello world")]
+#[case::escaped_octal_and_newline(&["\\101\\0377\\n"], "A\x1F7\n")]
+#[case::escaped_unicode_four_digit(&["\\u0125"], "ĥ")]
+#[case::escaped_unicode_eight_digit(&["\\U00000125"], "ĥ")]
+#[case::escaped_percent_sign(&["hello%% world"], "hello% world")]
+#[case::escaped_unrecognized(&["c\\d"], "c\\d")]
+#[case::sub_b_string_handle_escapes(&["hello %b", "\\tworld"], "hello \tworld")]
+#[case::sub_b_string_ignore_subs(&["hello %b", "world %% %i"], "hello world %% %i")]
+#[case::sub_q_string_non_printable(&["non-printable: %q", "\"$test\""], "non-printable: '\"$test\"'")]
+#[case::sub_q_string_special_non_printable(&["non-printable: %q", "test~"], "non-printable: test~")]
+#[case::sub_q_string_empty(&["%q", ""], "''")]
+#[case::sub_char(&["the letter %c", "A"], "the letter A")]
+#[case::sub_char_from_string(&["%c%c%c", "five", "%", "oval"], "f%o")]
+#[case::sub_num_int(&["twenty is %i", "20"], "twenty is 20")]
+#[case::sub_num_int_min_width(&["twenty is %1i", "20"], "twenty is 20")]
+#[case::sub_num_int_neg(&["neg. twenty is %i", "-20"], "neg. twenty is -20")]
+#[case::sub_num_int_oct_in(&["twenty is %i", "024"], "twenty is 20")]
+#[case::sub_num_int_oct_in_neg(&["neg. twenty is %i", "-024"], "neg. twenty is -20")]
+#[case::sub_num_int_hex_in(&["twenty is %i", "0x14"], "twenty is 20")]
+#[case::sub_num_int_hex_in_neg(&["neg. twenty is %i", "-0x14"], "neg. twenty is -20")]
+#[case::sub_num_uint(&["twenty is %u", "20"], "twenty is 20")]
+#[case::sub_num_octal(&["twenty in octal is %o", "20"], "twenty in octal is 24")]
+#[case::sub_num_hex_lower(&["thirty in hex is %x", "30"], "thirty in hex is 1e")]
+#[case::sub_num_hex_upper(&["thirty in hex is %X", "30"], "thirty in hex is 1E")]
+#[case::sub_num_float(&["twenty is %f", "20"], "twenty is 20.000000")]
+#[case::sub_num_float_e_round(&["%e", "99999999"], "1.000000e+08")]
+#[case::sub_num_float_e_no_round(&["%e", "99999994"], "9.999999e+07")]
+#[case::sub_num_float_round_to_one(&["one is %f", "0.9999995"], "one is 1.000000")]
+#[case::sub_num_float_round_nines_dec(&["%f", "0.99999999"], "1.000000")]
+#[case::sub_num_sci_lower(&["twenty is %e", "20"], "twenty is 2.000000e+01")]
+#[case::sub_num_sci_upper(&["twenty is %E", "20"], "twenty is 2.000000E+01")]
+#[case::sub_num_sci_trunc(&["pi is ~ %e", "3.1415926535"], "pi is ~ 3.141593e+00")]
+#[case::sub_num_dec_trunc(&["pi is ~ %g", "3.1415926535"], "pi is ~ 3.14159")]
+#[case::sub_num_sci_negative(&["-1234 is %e", "-1234"], "-1234 is -1.234000e+03")]
+#[case::sub_num_hex_float_lower(&["%a", ".875"], "0xep-4")]
+#[case::sub_num_hex_float_upper(&["%A", ".875"], "0XEP-4")]
+#[case::sub_min_width(&["hello %7s", "world"], "hello   world")]
+#[case::sub_min_width_negative(&["hello %-7s", "world"], "hello world  ")]
+#[case::sub_str_max_chars_input(&["hello %7.2s", "world"], "hello      wo")]
+#[case::sub_int_decimal(&["%0.i", "11"], "11")]
+#[case::sub_int_leading_zeroes(&["%.4i", "11"], "0011")]
+#[case::sub_int_leading_zeroes_padded(&["%5.4i", "11"], " 0011")]
+#[case::sub_float_dec_places(&["pi is ~ %.11f", "3.1415926535"], "pi is ~ 3.14159265350")]
+#[case::sub_float_hex_in(&["%f", "0xF1.1F"], "241.121094")]
+#[case::sub_float_no_octal_in(&["%f", "077"], "77.000000")]
+#[case::sub_any_asterisk_first_param(&["%*i", "3", "11", "4", "12"], " 11  12")]
+#[case::sub_any_asterisk_second_param(&["%.*i", "3", "11", "4", "12"], "0110012")]
+#[case::sub_any_asterisk_both_params(&["%*.*i", "4", "3", "11", "5", "4", "12"], " 011 0012")]
+#[case::sub_any_asterisk_octal_arg(&["%.*i", "011", "12345678"], "012345678")]
+#[case::sub_any_asterisk_hex_arg(&["%.*i", "0xA", "123456789"], "0123456789")]
+#[case::unspecified_left_justify_is_1_width(&["%-o"], "0")]
+#[case::stop_after_additional_escape(&["A%sC\\cD%sF", "B", "E"], "ABC")]
+#[case::sub_float_leading_zeroes(&["%010f", "1"], "001.000000")]
+#[case::sub_general_float(&["%g", "1.1"], "1.1")]
+#[case::sub_general_truncate_to_integer(&["%g", "1.0"], "1")]
+#[case::sub_general_scientific_notation(&["%g", "1000010"], "1.00001e+06")]
+#[case::sub_general_round_scientific_notation(&["%g", "123456789"], "1.23457e+08")]
+#[case::sub_general_round_float(&["%g", "12345.6789"], "12345.7")]
+#[case::sub_general_round_float_to_integer(&["%g", "123456.7"], "123457")]
+#[case::sub_general_round_float_leading_zeroes(&["%g", "1.000009"], "1.00001")]
+#[case::sub_alternative_lower_hex_0(&["%#x", "0"], "0")]
+#[case::sub_alternative_lower_hex(&["%#x", "42"], "0x2a")]
+#[case::sub_alternative_upper_hex_0(&["%#X", "0"], "0")]
+#[case::sub_alternative_upper_hex(&["%#X", "42"], "0X2A")]
+#[case::zero_padding_with_space_test(&["% 03d", "1"], " 01")]
+#[case::zero_padding_with_plus_test(&["%+04d", "1"], "+001")]
+#[case::negative_zero_padding_test(&["%03d", "-1"], "-01")]
+#[case::negative_zero_padding_with_space_test(&["% 03d", "-1"], "-01")]
+#[case::spaces_before_numbers_are_ignored(&["%*.*d", "   5", "  3", " 6"], "  006")]
+#[case::float_with_zero_precision_should_pad(&["%03.0f", "-1"], "-01")]
+#[case::float_non_finite(&["%f %f %F %f %f %F", "nan", "-nan", "nan", "inf", "-inf", "inf"], "nan -nan NAN inf -inf INF")]
+#[case::float_zero_neg_zero(&["%f %f", "0.0", "-0.0"], "0.000000 -0.000000")]
+#[case::precision_check(&["%.3d", "1"], "001")]
+#[case::space_padding_with_precision(&["%4.3d", "1"], " 001")]
+#[case::float_zero_padding_with_precision(&["%04.1f", "1"], "01.0")]
+#[case::float_space_padding_with_precision(&["%4.1f", "1"], " 1.0")]
+#[case::negative_float_zero_padding_with_precision(&["%05.1f", "-1"], "-01.0")]
+#[case::float_default_precision_space_padding(&["%10f", "1"], "  1.000000")]
+#[case::float_default_precision_zero_padding(&["%010f", "1"], "001.000000")]
+#[case::flag_position_space_padding(&["% +3.1d", "1"], " +1")]
+#[case::float_flag_position_space_padding(&["% +5.1f", "1"], " +1.0")]
+#[case::float_non_finite_space_padding(&["% 5.2f|% 5.2f|% 5.2f|% 5.2f", "inf", "-inf", "nan", "-nan"], "  inf| -inf|  nan| -nan")]
+#[case::test_emoji_formatting(&["Status: %s 🎯 Count: %d\n", "Success 🚀", "42"], "Status: Success 🚀 🎯 Count: 42\n")]
+#[case::leading_double_dash_ends_the_options(&["--", "%s\n", "a"], "a\n")]
+fn test_printf_formats(#[case] args: &[&str], #[case] expected: &str) {
+    new_ucmd!().args(args).succeeds().stdout_only(expected);
 }
 
 #[test]
@@ -20,14 +103,6 @@ fn test_missing_escaped_hex_value() {
         .arg(r"\x")
         .fails_with_code(1)
         .stderr_only("printf: missing hexadecimal number in escape\n");
-}
-
-#[test]
-fn escaped_octal_and_newline() {
-    new_ucmd!()
-        .args(&["\\101\\0377\\n"])
-        .succeeds()
-        .stdout_only("A\x1F7\n");
 }
 
 #[test]
@@ -43,19 +118,6 @@ fn variable_sized_octal() {
         .arg("|\\0005|")
         .succeeds()
         .stdout_only_bytes([b'|', 0, b'5', b'|']);
-}
-
-#[test]
-fn escaped_unicode_four_digit() {
-    new_ucmd!().args(&["\\u0125"]).succeeds().stdout_only("ĥ");
-}
-
-#[test]
-fn escaped_unicode_eight_digit() {
-    new_ucmd!()
-        .args(&["\\U00000125"])
-        .succeeds()
-        .stdout_only("ĥ");
 }
 
 #[test]
@@ -92,27 +154,6 @@ fn escaped_unicode_invalid() {
 }
 
 #[test]
-fn escaped_percent_sign() {
-    new_ucmd!()
-        .args(&["hello%% world"])
-        .succeeds()
-        .stdout_only("hello% world");
-}
-
-#[test]
-fn escaped_unrecognized() {
-    new_ucmd!().args(&["c\\d"]).succeeds().stdout_only("c\\d");
-}
-
-#[test]
-fn sub_b_string_handle_escapes() {
-    new_ucmd!()
-        .args(&["hello %b", "\\tworld"])
-        .succeeds()
-        .stdout_only("hello \tworld");
-}
-
-#[test]
 fn sub_b_string_variable_size_unicode() {
     for x in ["\\5|", "\\05|", "\\005|", "\\0005|"] {
         new_ucmd!()
@@ -137,113 +178,12 @@ fn sub_b_string_validate_field_params() {
 }
 
 #[test]
-fn sub_b_string_ignore_subs() {
-    new_ucmd!()
-        .args(&["hello %b", "world %% %i"])
-        .succeeds()
-        .stdout_only("hello world %% %i");
-}
-
-#[test]
-fn sub_q_string_non_printable() {
-    new_ucmd!()
-        .args(&["non-printable: %q", "\"$test\""])
-        .succeeds()
-        .stdout_only("non-printable: '\"$test\"'");
-}
-
-#[test]
 fn sub_q_string_validate_field_params() {
     new_ucmd!()
         .args(&["hello %7q", "world"])
         .fails()
         .stdout_is("hello ")
         .stderr_is("printf: %7q: invalid conversion specification\n");
-}
-
-#[test]
-fn sub_q_string_special_non_printable() {
-    new_ucmd!()
-        .args(&["non-printable: %q", "test~"])
-        .succeeds()
-        .stdout_only("non-printable: test~");
-}
-
-#[test]
-fn sub_q_string_empty() {
-    new_ucmd!().args(&["%q", ""]).succeeds().stdout_only("''");
-}
-
-#[test]
-fn sub_char() {
-    new_ucmd!()
-        .args(&["the letter %c", "A"])
-        .succeeds()
-        .stdout_only("the letter A");
-}
-
-#[test]
-fn sub_char_from_string() {
-    new_ucmd!()
-        .args(&["%c%c%c", "five", "%", "oval"])
-        .succeeds()
-        .stdout_only("f%o");
-}
-
-#[test]
-fn sub_num_int() {
-    new_ucmd!()
-        .args(&["twenty is %i", "20"])
-        .succeeds()
-        .stdout_only("twenty is 20");
-}
-
-#[test]
-fn sub_num_int_min_width() {
-    new_ucmd!()
-        .args(&["twenty is %1i", "20"])
-        .succeeds()
-        .stdout_only("twenty is 20");
-}
-
-#[test]
-fn sub_num_int_neg() {
-    new_ucmd!()
-        .args(&["neg. twenty is %i", "-20"])
-        .succeeds()
-        .stdout_only("neg. twenty is -20");
-}
-
-#[test]
-fn sub_num_int_oct_in() {
-    new_ucmd!()
-        .args(&["twenty is %i", "024"])
-        .succeeds()
-        .stdout_only("twenty is 20");
-}
-
-#[test]
-fn sub_num_int_oct_in_neg() {
-    new_ucmd!()
-        .args(&["neg. twenty is %i", "-024"])
-        .succeeds()
-        .stdout_only("neg. twenty is -20");
-}
-
-#[test]
-fn sub_num_int_hex_in() {
-    new_ucmd!()
-        .args(&["twenty is %i", "0x14"])
-        .succeeds()
-        .stdout_only("twenty is 20");
-}
-
-#[test]
-fn sub_num_int_hex_in_neg() {
-    new_ucmd!()
-        .args(&["neg. twenty is %i", "-0x14"])
-        .succeeds()
-        .stdout_only("neg. twenty is -20");
 }
 
 #[test]
@@ -270,6 +210,22 @@ fn sub_num_int_char_const_in() {
 }
 
 #[test]
+fn char_constant_warning_preserves_prior_failure() {
+    new_ucmd!()
+        .args(&["%d\n", "bad", "'ab"])
+        .fails_with_code(1)
+        .stdout_is("0\n97\n")
+        .stderr_is("printf: 'bad': expected a numeric value\nprintf: warning: b: character(s) following character constant have been ignored\n");
+
+    new_ucmd!()
+        .args(&["%d\n", "bad", "'ab"])
+        .env("POSIXLY_CORRECT", "1")
+        .fails_with_code(1)
+        .stdout_is("0\n97\n")
+        .stderr_is("printf: 'bad': expected a numeric value\n");
+}
+
+#[test]
 fn sub_num_thousands() {
     // For "C" locale, the thousands separator is ignored but should
     // not result in an error
@@ -280,74 +236,10 @@ fn sub_num_thousands() {
 }
 
 #[test]
-fn sub_num_uint() {
-    new_ucmd!()
-        .args(&["twenty is %u", "20"])
-        .succeeds()
-        .stdout_only("twenty is 20");
-}
-
-#[test]
-fn sub_num_octal() {
-    new_ucmd!()
-        .args(&["twenty in octal is %o", "20"])
-        .succeeds()
-        .stdout_only("twenty in octal is 24");
-}
-
-#[test]
-fn sub_num_hex_lower() {
-    new_ucmd!()
-        .args(&["thirty in hex is %x", "30"])
-        .succeeds()
-        .stdout_only("thirty in hex is 1e");
-}
-
-#[test]
-fn sub_num_hex_upper() {
-    new_ucmd!()
-        .args(&["thirty in hex is %X", "30"])
-        .succeeds()
-        .stdout_only("thirty in hex is 1E");
-}
-
-#[test]
 fn sub_num_hex_non_numerical() {
     new_ucmd!()
         .args(&["parameters need to be numbers %X", "%194"])
         .fails_with_code(1);
-}
-
-#[test]
-fn sub_num_float() {
-    new_ucmd!()
-        .args(&["twenty is %f", "20"])
-        .succeeds()
-        .stdout_only("twenty is 20.000000");
-}
-
-#[test]
-fn sub_num_float_e_round() {
-    new_ucmd!()
-        .args(&["%e", "99999999"])
-        .succeeds()
-        .stdout_only("1.000000e+08");
-}
-
-#[test]
-fn sub_num_float_e_no_round() {
-    new_ucmd!()
-        .args(&["%e", "99999994"])
-        .succeeds()
-        .stdout_only("9.999999e+07");
-}
-
-#[test]
-fn sub_num_float_round_to_one() {
-    new_ucmd!()
-        .args(&["one is %f", "0.9999995"])
-        .succeeds()
-        .stdout_only("one is 1.000000");
 }
 
 #[test]
@@ -360,179 +252,16 @@ fn sub_num_float_round_to_two() {
 }
 
 #[test]
-fn sub_num_float_round_nines_dec() {
+fn sub_string_char_width_above_u16_max_no_panic() {
+    // A %s/%c field width above u16::MAX must not panic (#12593, #12900).
     new_ucmd!()
-        .args(&["%f", "0.99999999"])
+        .args(&["%100000c", "A"])
         .succeeds()
-        .stdout_only("1.000000");
-}
-
-#[test]
-fn sub_num_sci_lower() {
+        .stdout_only(format!("{}A", " ".repeat(99999)));
     new_ucmd!()
-        .args(&["twenty is %e", "20"])
+        .args(&["%-100000s", "hi"])
         .succeeds()
-        .stdout_only("twenty is 2.000000e+01");
-}
-
-#[test]
-fn sub_num_sci_upper() {
-    new_ucmd!()
-        .args(&["twenty is %E", "20"])
-        .succeeds()
-        .stdout_only("twenty is 2.000000E+01");
-}
-
-#[test]
-fn sub_num_sci_trunc() {
-    new_ucmd!()
-        .args(&["pi is ~ %e", "3.1415926535"])
-        .succeeds()
-        .stdout_only("pi is ~ 3.141593e+00");
-}
-
-#[test]
-fn sub_num_dec_trunc() {
-    new_ucmd!()
-        .args(&["pi is ~ %g", "3.1415926535"])
-        .succeeds()
-        .stdout_only("pi is ~ 3.14159");
-}
-
-#[test]
-fn sub_num_sci_negative() {
-    new_ucmd!()
-        .args(&["-1234 is %e", "-1234"])
-        .succeeds()
-        .stdout_only("-1234 is -1.234000e+03");
-}
-
-#[test]
-fn sub_num_hex_float_lower() {
-    new_ucmd!()
-        .args(&["%a", ".875"])
-        .succeeds()
-        .stdout_only("0xep-4");
-}
-
-#[test]
-fn sub_num_hex_float_upper() {
-    new_ucmd!()
-        .args(&["%A", ".875"])
-        .succeeds()
-        .stdout_only("0XEP-4");
-}
-
-#[test]
-fn sub_min_width() {
-    new_ucmd!()
-        .args(&["hello %7s", "world"])
-        .succeeds()
-        .stdout_only("hello   world");
-}
-
-#[test]
-fn sub_min_width_negative() {
-    new_ucmd!()
-        .args(&["hello %-7s", "world"])
-        .succeeds()
-        .stdout_only("hello world  ");
-}
-
-#[test]
-fn sub_str_max_chars_input() {
-    new_ucmd!()
-        .args(&["hello %7.2s", "world"])
-        .succeeds()
-        .stdout_only("hello      wo");
-}
-
-#[test]
-fn sub_int_decimal() {
-    new_ucmd!()
-        .args(&["%0.i", "11"])
-        .succeeds()
-        .stdout_only("11");
-}
-
-#[test]
-fn sub_int_leading_zeroes() {
-    new_ucmd!()
-        .args(&["%.4i", "11"])
-        .succeeds()
-        .stdout_only("0011");
-}
-
-#[test]
-fn sub_int_leading_zeroes_padded() {
-    new_ucmd!()
-        .args(&["%5.4i", "11"])
-        .succeeds()
-        .stdout_only(" 0011");
-}
-
-#[test]
-fn sub_float_dec_places() {
-    new_ucmd!()
-        .args(&["pi is ~ %.11f", "3.1415926535"])
-        .succeeds()
-        .stdout_only("pi is ~ 3.14159265350");
-}
-
-#[test]
-fn sub_float_hex_in() {
-    new_ucmd!()
-        .args(&["%f", "0xF1.1F"])
-        .succeeds()
-        .stdout_only("241.121094");
-}
-
-#[test]
-fn sub_float_no_octal_in() {
-    new_ucmd!()
-        .args(&["%f", "077"])
-        .succeeds()
-        .stdout_only("77.000000");
-}
-
-#[test]
-fn sub_any_asterisk_first_param() {
-    new_ucmd!()
-        .args(&["%*i", "3", "11", "4", "12"])
-        .succeeds()
-        .stdout_only(" 11  12");
-}
-
-#[test]
-fn sub_any_asterisk_second_param() {
-    new_ucmd!()
-        .args(&["%.*i", "3", "11", "4", "12"])
-        .succeeds()
-        .stdout_only("0110012");
-}
-
-#[test]
-fn sub_any_asterisk_both_params() {
-    new_ucmd!()
-        .args(&["%*.*i", "4", "3", "11", "5", "4", "12"])
-        .succeeds()
-        .stdout_only(" 011 0012");
-}
-
-#[test]
-fn sub_any_asterisk_octal_arg() {
-    new_ucmd!()
-        .args(&["%.*i", "011", "12345678"])
-        .succeeds()
-        .stdout_only("012345678");
-}
-
-#[test]
-fn sub_any_asterisk_hex_arg() {
-    new_ucmd!()
-        .args(&["%.*i", "0xA", "123456789"])
-        .succeeds()
-        .stdout_only("0123456789");
+        .stdout_only(format!("hi{}", " ".repeat(99998)));
 }
 
 #[test]
@@ -640,11 +369,6 @@ fn sub_any_specifiers() {
 }
 
 #[test]
-fn unspecified_left_justify_is_1_width() {
-    new_ucmd!().args(&["%-o"]).succeeds().stdout_only("0");
-}
-
-#[test]
 fn sub_any_specifiers_after_second_param() {
     new_ucmd!()
         .args(&["%0.0ztlhLji", "3"]) //spell-checker:disable-line
@@ -653,72 +377,13 @@ fn sub_any_specifiers_after_second_param() {
 }
 
 #[test]
-fn stop_after_additional_escape() {
+fn stop_after_additional_escape_in_b_string() {
+    // A `\c` inside a %b argument must stop the entire invocation, not just
+    // that argument's own expansion.
     new_ucmd!()
-        .args(&["A%sC\\cD%sF", "B", "E"])
+        .args(&["A%bB\\n", "x\\cy"])
         .succeeds()
-        .stdout_only("ABC");
-}
-
-#[test]
-fn sub_float_leading_zeroes() {
-    new_ucmd!()
-        .args(&["%010f", "1"])
-        .succeeds()
-        .stdout_only("001.000000");
-}
-
-#[test]
-fn sub_general_float() {
-    new_ucmd!()
-        .args(&["%g", "1.1"])
-        .succeeds()
-        .stdout_only("1.1");
-}
-
-#[test]
-fn sub_general_truncate_to_integer() {
-    new_ucmd!().args(&["%g", "1.0"]).succeeds().stdout_only("1");
-}
-
-#[test]
-fn sub_general_scientific_notation() {
-    new_ucmd!()
-        .args(&["%g", "1000010"])
-        .succeeds()
-        .stdout_only("1.00001e+06");
-}
-
-#[test]
-fn sub_general_round_scientific_notation() {
-    new_ucmd!()
-        .args(&["%g", "123456789"])
-        .succeeds()
-        .stdout_only("1.23457e+08");
-}
-
-#[test]
-fn sub_general_round_float() {
-    new_ucmd!()
-        .args(&["%g", "12345.6789"])
-        .succeeds()
-        .stdout_only("12345.7");
-}
-
-#[test]
-fn sub_general_round_float_to_integer() {
-    new_ucmd!()
-        .args(&["%g", "123456.7"])
-        .succeeds()
-        .stdout_only("123457");
-}
-
-#[test]
-fn sub_general_round_float_leading_zeroes() {
-    new_ucmd!()
-        .args(&["%g", "1.000009"])
-        .succeeds()
-        .stdout_only("1.00001");
+        .stdout_only("Ax");
 }
 
 #[test]
@@ -842,29 +507,37 @@ fn partial_char() {
 }
 
 #[test]
-fn sub_alternative_lower_hex_0() {
-    new_ucmd!().args(&["%#x", "0"]).succeeds().stdout_only("0");
+fn partial_char_posixly_correct() {
+    // GNU suppresses the "character(s) following character constant" warning
+    // when POSIXLY_CORRECT is set. Only the presence of the variable matters,
+    // its value is irrelevant.
+    for value in ["1", "", "0"] {
+        for arg in ["'AB", "'ABC", "\"AB", "'-1"] {
+            new_ucmd!()
+                .args(&["%d", arg])
+                .env("POSIXLY_CORRECT", value)
+                .succeeds()
+                .no_stderr();
+        }
+    }
+
+    // Without POSIXLY_CORRECT the warning is still emitted.
+    for (arg, rest) in [("'AB", "B"), ("'ABC", "BC"), ("\"AB", "B"), ("'-1", "1")] {
+        new_ucmd!().args(&["%d", arg]).succeeds().stderr_is(format!(
+            "printf: warning: {rest}: character(s) following character constant have been ignored\n"
+        ));
+    }
 }
 
 #[test]
-fn sub_alternative_lower_hex() {
+fn value_not_completely_converted_ignores_posixly_correct() {
+    // POSIXLY_CORRECT only silences the character-constant warning; the
+    // unrelated "value not completely converted" error is unaffected.
     new_ucmd!()
-        .args(&["%#x", "42"])
-        .succeeds()
-        .stdout_only("0x2a");
-}
-
-#[test]
-fn sub_alternative_upper_hex_0() {
-    new_ucmd!().args(&["%#X", "0"]).succeeds().stdout_only("0");
-}
-
-#[test]
-fn sub_alternative_upper_hex() {
-    new_ucmd!()
-        .args(&["%#X", "42"])
-        .succeeds()
-        .stdout_only("0X2A");
+        .args(&["%d", "42abc"])
+        .env("POSIXLY_CORRECT", "1")
+        .fails_with_code(1)
+        .stderr_contains("value not completely converted");
 }
 
 #[test]
@@ -1003,54 +676,6 @@ fn space_padding_with_space_test() {
 }
 
 #[test]
-fn zero_padding_with_space_test() {
-    new_ucmd!()
-        .args(&["% 03d", "1"])
-        .succeeds()
-        .stdout_only(" 01");
-}
-
-#[test]
-fn zero_padding_with_plus_test() {
-    new_ucmd!()
-        .args(&["%+04d", "1"])
-        .succeeds()
-        .stdout_only("+001");
-}
-
-#[test]
-fn negative_zero_padding_test() {
-    new_ucmd!()
-        .args(&["%03d", "-1"])
-        .succeeds()
-        .stdout_only("-01");
-}
-
-#[test]
-fn negative_zero_padding_with_space_test() {
-    new_ucmd!()
-        .args(&["% 03d", "-1"])
-        .succeeds()
-        .stdout_only("-01");
-}
-
-#[test]
-fn spaces_before_numbers_are_ignored() {
-    new_ucmd!()
-        .args(&["%*.*d", "   5", "  3", " 6"])
-        .succeeds()
-        .stdout_only("  006");
-}
-
-#[test]
-fn float_with_zero_precision_should_pad() {
-    new_ucmd!()
-        .args(&["%03.0f", "-1"])
-        .succeeds()
-        .stdout_only("-01");
-}
-
-#[test]
 fn int_with_zero_precision_and_zero_value() {
     new_ucmd!().args(&["%.0d", "0"]).succeeds().stdout_only("");
     new_ucmd!()
@@ -1065,102 +690,6 @@ fn int_with_zero_precision_and_zero_value() {
 }
 
 #[test]
-fn float_non_finite() {
-    new_ucmd!()
-        .args(&[
-            "%f %f %F %f %f %F",
-            "nan",
-            "-nan",
-            "nan",
-            "inf",
-            "-inf",
-            "inf",
-        ])
-        .succeeds()
-        .stdout_only("nan -nan NAN inf -inf INF");
-}
-
-#[test]
-fn float_zero_neg_zero() {
-    new_ucmd!()
-        .args(&["%f %f", "0.0", "-0.0"])
-        .succeeds()
-        .stdout_only("0.000000 -0.000000");
-}
-
-#[test]
-fn precision_check() {
-    new_ucmd!()
-        .args(&["%.3d", "1"])
-        .succeeds()
-        .stdout_only("001");
-}
-
-#[test]
-fn space_padding_with_precision() {
-    new_ucmd!()
-        .args(&["%4.3d", "1"])
-        .succeeds()
-        .stdout_only(" 001");
-}
-
-#[test]
-fn float_zero_padding_with_precision() {
-    new_ucmd!()
-        .args(&["%04.1f", "1"])
-        .succeeds()
-        .stdout_only("01.0");
-}
-
-#[test]
-fn float_space_padding_with_precision() {
-    new_ucmd!()
-        .args(&["%4.1f", "1"])
-        .succeeds()
-        .stdout_only(" 1.0");
-}
-
-#[test]
-fn negative_float_zero_padding_with_precision() {
-    new_ucmd!()
-        .args(&["%05.1f", "-1"])
-        .succeeds()
-        .stdout_only("-01.0");
-}
-
-#[test]
-fn float_default_precision_space_padding() {
-    new_ucmd!()
-        .args(&["%10f", "1"])
-        .succeeds()
-        .stdout_only("  1.000000");
-}
-
-#[test]
-fn float_default_precision_zero_padding() {
-    new_ucmd!()
-        .args(&["%010f", "1"])
-        .succeeds()
-        .stdout_only("001.000000");
-}
-
-#[test]
-fn flag_position_space_padding() {
-    new_ucmd!()
-        .args(&["% +3.1d", "1"])
-        .succeeds()
-        .stdout_only(" +1");
-}
-
-#[test]
-fn float_flag_position_space_padding() {
-    new_ucmd!()
-        .args(&["% +5.1f", "1"])
-        .succeeds()
-        .stdout_only(" +1.0");
-}
-
-#[test]
 fn float_large_precision() {
     // Note: This does not match GNU coreutils output (0.100000000000000000001355252716 on x86),
     // as we parse and format using ExtendedBigDecimal, which provides arbitrary precision.
@@ -1168,14 +697,6 @@ fn float_large_precision() {
         .args(&["%.30f", "0.1"])
         .succeeds()
         .stdout_only("0.100000000000000000000000000000");
-}
-
-#[test]
-fn float_non_finite_space_padding() {
-    new_ucmd!()
-        .args(&["% 5.2f|% 5.2f|% 5.2f|% 5.2f", "inf", "-inf", "nan", "-nan"])
-        .succeeds()
-        .stdout_only("  inf| -inf|  nan| -nan");
 }
 
 #[test]
@@ -1378,7 +899,7 @@ fn mb_input() {
 }
 
 #[test]
-#[cfg(target_family = "unix")]
+#[cfg(unix)]
 #[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn mb_invalid_unicode() {
     use std::ffi::OsStr;
@@ -1467,7 +988,7 @@ fn positional_format_specifiers() {
 }
 
 #[test]
-#[cfg(target_family = "unix")]
+#[cfg(unix)]
 #[cfg_attr(wasi_runner, ignore = "WASI: argv/filenames must be valid UTF-8")]
 fn non_utf_8_input() {
     use std::ffi::OsStr;
@@ -1499,14 +1020,6 @@ fn non_utf_8_input() {
         .stderr_contains("expected a numeric value");
 }
 
-#[test]
-fn test_emoji_formatting() {
-    new_ucmd!()
-        .args(&["Status: %s 🎯 Count: %d\n", "Success 🚀", "42"])
-        .succeeds()
-        .stdout_only("Status: Success 🚀 🎯 Count: 42\n");
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn test_write_error_omits_errno() {
@@ -1536,8 +1049,20 @@ fn test_large_width_format() {
             .args(&[format, arg])
             .fails_with_code(1)
             .stderr_contains("write error")
-            .stdout_is("");
+            .no_stdout();
     }
+}
+
+#[test]
+fn test_numeric_field_width_above_u16_max() {
+    const WIDTH: usize = 65_536;
+
+    let result = new_ucmd!().args(&["%65536d", "5"]).succeeds();
+    let stdout = result.stdout();
+
+    assert_eq!(stdout.len(), WIDTH);
+    assert!(stdout[..WIDTH - 1].iter().all(|&byte| byte == b' '));
+    assert_eq!(stdout[WIDTH - 1], b'5');
 }
 
 #[test]
@@ -1756,4 +1281,93 @@ printf: %z: invalid conversion specification
             .fails_with_code(1)
             .stderr_only("printf: %5.2c: invalid conversion specification\n");
     }
+}
+
+#[test]
+fn double_dash_after_the_format_is_an_argument() {
+    new_ucmd!()
+        .args(&["%s\n", "--"])
+        .succeeds()
+        .stdout_only("--\n");
+
+    new_ucmd!()
+        .args(&["%s %s\n", "--", "--"])
+        .succeeds()
+        .stdout_only("-- --\n");
+
+    // Only the first `--` terminates the options; the second one is data.
+    new_ucmd!()
+        .args(&["--", "%s\n", "--"])
+        .succeeds()
+        .stdout_only("--\n");
+}
+
+#[test]
+fn double_dash_as_the_format_is_printed_literally() {
+    new_ucmd!()
+        .args(&["--", "--", "x"])
+        .succeeds()
+        .stdout_is("--")
+        .stderr_contains("warning: ignoring excess arguments, starting with 'x'");
+}
+
+#[test]
+fn help_and_version_past_the_format_are_arguments() {
+    new_ucmd!()
+        .args(&["%s", "--help"])
+        .succeeds()
+        .stdout_only("--help");
+
+    new_ucmd!()
+        .args(&["%s", "--version"])
+        .succeeds()
+        .stdout_only("--version");
+
+    new_ucmd!()
+        .args(&["--", "--help"])
+        .succeeds()
+        .stdout_only("--help");
+}
+
+#[test]
+fn test_precision_above_formatter_limit() {
+    // A precision larger than u16::MAX must still be honoured in full.
+    let result = new_ucmd!().args(&["%.70123f", "3.25"]).succeeds();
+    let out = result.stdout_str();
+    assert_eq!(out.len(), 70_125);
+    assert!(out.starts_with("3.25"));
+    assert!(out[4..].bytes().all(|b| b == b'0'));
+}
+
+#[test]
+fn test_integer_precision_above_padding_limit() {
+    new_ucmd!()
+        .args(&["%.1500f", "1"])
+        .succeeds()
+        .stdout_only(format!("1.{}", "0".repeat(1500)));
+    new_ucmd!()
+        .args(&["%f", "1e1001"])
+        .succeeds()
+        .stdout_only(format!("1{}.000000", "0".repeat(1001)));
+    new_ucmd!()
+        .args(&["%#.0f", "1e1001"])
+        .succeeds()
+        .stdout_only(format!("1{}.", "0".repeat(1001)));
+}
+
+#[test]
+fn test_zero_precision_above_formatter_limit() {
+    let zeros = "0".repeat(70000);
+    new_ucmd!()
+        .args(&["%.70000e", "0"])
+        .succeeds()
+        .stdout_only(format!("0.{zeros}e+00"));
+    new_ucmd!()
+        .args(&["%.70000A", "0"])
+        .succeeds()
+        .stdout_only(format!("0X0.{zeros}P+0"));
+    new_ucmd!()
+        .args(&["%#.70000g", "0"])
+        .succeeds()
+        .stdout_only(format!("0.{}", &zeros[1..]));
 }

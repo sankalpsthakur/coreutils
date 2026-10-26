@@ -8,7 +8,7 @@ common-usage = Utilisation
 common-help = aide
 common-version = version
 common-write-error = erreur d'écriture
-
+common-read-error = erreur de lecture
 # Messages d'erreur clap communs
 clap-error-unexpected-argument = { $error_word } : argument inattendu '{ $arg }' trouvé
 clap-error-unexpected-argument-simple = argument inattendu
@@ -31,7 +31,9 @@ error-permission-denied = Permission refusée
 error-file-not-found = Aucun fichier ou répertoire de ce type
 error-no-such-process = Aucun processus de ce type
 error-invalid-argument = Argument invalide
-error-is-a-directory = { $file }: Est un répertoire
+error-is-a-directory-text = Est un répertoire
+error-is-a-directory = { $file }: { error-is-a-directory-text }
+error-too-many-symlink-levels = Trop de niveaux de liens symboliques
 
 # Actions communes
 action-copying = copie
@@ -87,3 +89,7 @@ mode-error-invalid-operator = opérateur invalide (+, - ou = attendu, mais { $op
 mode-diag-label-missing-operator = cette clause indique qui, mais pas quoi changer
 mode-diag-label-invalid-number = n'est pas un mode octal
 mode-diag-help-syntax = un mode est soit octal, comme 644, soit des clauses comme u+rwx,go-w
+
+# Messages d'erreur d'encodage/décodage (base32, base64, basenc)
+encoding-error-invalid-input = entrée invalide
+encoding-error-invalid-input-z85-length = entrée invalide (la longueur doit être un multiple de 4 caractères)

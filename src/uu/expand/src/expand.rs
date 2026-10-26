@@ -8,11 +8,10 @@
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write, stdin, stdout};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
 use std::num::IntErrorKind;
 use std::path::Path;
 use std::str::from_utf8;
-use thiserror::Error;
 use uucore::char_width::char_width_at;
 use uucore::display::Quotable;
 use uucore::error::{FromIo, UError, UResult, set_exit_code};
@@ -36,26 +35,13 @@ enum RemainingMode {
     Plus,
 }
 
-/// Decide whether the character is either a space or a comma.
-///
-/// # Examples
-///
-/// ```rust,ignore
-/// assert!(is_space_or_comma(' '))
-/// assert!(is_space_or_comma(','))
-/// assert!(!is_space_or_comma('a'))
-/// ```
-fn is_space_or_comma(c: char) -> bool {
-    c == ' ' || c == ','
-}
-
 /// Decide whether the character is either a digit or a comma.
 fn is_digit_or_comma(c: char) -> bool {
     c.is_ascii_digit() || c == ','
 }
 
 /// Errors that can occur when parsing a `--tabs` argument.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 enum ParseError {
     #[error("{}", translate!("expand-error-invalid-character", "char" => .0.quote()))]
     InvalidCharacter(String),
@@ -76,16 +62,16 @@ impl UError for ParseError {}
 /// Parse a list of tabstops from a `--tabs` argument.
 ///
 /// This function returns both the vector of numbers appearing in the
-/// comma- or space-separated list, and also an optional mode, specified
+/// space-, tab-, or comma-separated list, and also an optional mode, specified
 /// by either a "/" or a "+" character appearing before the final number
 /// in the list. This mode defines the strategy to use for computing the
 /// number of spaces to use for columns beyond the end of the tab stop
 /// list specified here.
 fn tabstops_parse(s: &str) -> Result<(RemainingMode, Vec<usize>), ParseError> {
-    // Leading commas and spaces are ignored.
-    let s = s.trim_start_matches(is_space_or_comma);
+    // Leading spaces, tabs, and commas are ignored.
+    let s = s.trim_start_matches([' ', '\t', ',']);
 
-    // If there were only commas and spaces in the string, just use the
+    // If there were only spaces, tabs, and commas in the string, just use the
     // default tabstops.
     if s.is_empty() {
         return Ok((RemainingMode::None, vec![DEFAULT_TABSTOP]));
@@ -94,7 +80,7 @@ fn tabstops_parse(s: &str) -> Result<(RemainingMode, Vec<usize>), ParseError> {
     let mut nums = vec![];
     let mut remaining_mode = RemainingMode::None;
     let mut is_specifier_already_used = false;
-    for word in s.split(is_space_or_comma) {
+    for word in s.split([' ', '\t', ',']) {
         let bytes = word.as_bytes();
         for i in 0..bytes.len() {
             match bytes[i] {
@@ -106,8 +92,12 @@ fn tabstops_parse(s: &str) -> Result<(RemainingMode, Vec<usize>), ParseError> {
                     match s.parse::<usize>() {
                         // Tab size must be positive.
                         Ok(0) => return Err(ParseError::TabSizeCannotBeZero),
-                        // Tab sizes must be ascending.
-                        Ok(num) if nums.last().is_some_and(|last| *last >= num) => {
+                        // Tab stops must be ascending. A number after `/` or `+` is a
+                        // tab size for the remaining columns, not a tab stop.
+                        Ok(num)
+                            if remaining_mode == RemainingMode::None
+                                && nums.last().is_some_and(|last| *last >= num) =>
+                        {
                             return Err(ParseError::TabSizesMustBeAscending);
                         }
                         Ok(num) => {
@@ -274,7 +264,7 @@ fn open(path: &OsString) -> UResult<BufReader<Box<dyn Read>>> {
     }
     let path_ref = Path::new(path);
     // some platforms cannot catch this as read error. accept additional overhead.
-    #[cfg(any(target_os = "wasi", target_os = "windows"))]
+    #[cfg(any(target_os = "wasi", windows))]
     if path_ref.is_dir() {
         return Err(uucore::error::USimpleError::new(
             1,
@@ -458,16 +448,17 @@ fn expand_file(
     output: &mut BufWriter<std::io::Stdout>,
     options: &Options,
 ) -> UResult<()> {
-    let mut buf = [0u8; 4096];
     let mut input = open(file)?;
     let ts = options.tabstops.as_ref();
     let mut col = 0;
     loop {
-        match input.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                expand_buf(&buf[..n], output, ts, options, &mut col)
+        match input.fill_buf() {
+            Ok([]) => break,
+            Ok(buf) => {
+                expand_buf(buf, output, ts, options, &mut col)
                     .map_err_context(|| translate!("expand-error-failed-to-write-output"))?;
+                let len = buf.len();
+                input.consume(len);
             }
             Err(e) => return Err(e.map_err_context(|| file.maybe_quote().to_string())),
         }

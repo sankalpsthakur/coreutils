@@ -17,7 +17,7 @@ use uucore::display::Quotable;
 use uucore::error::{UResult, USimpleError, set_exit_code};
 #[cfg(target_os = "linux")]
 use uucore::signals::ensure_stdout_not_broken;
-use uucore::translate;
+use uucore::{translate, translate_text};
 
 use uucore::show_error;
 
@@ -39,6 +39,12 @@ impl WatcherRx {
         let mut path = path.to_owned();
         #[cfg(target_os = "linux")]
         if path.is_file() {
+            // The directory watch reports a write to a symlink's target under
+            // the target's name, not the link's, so also watch the link: it is
+            // another inode than the directory and nothing is reported twice.
+            if path.is_symlink() {
+                self.watch(&path, RecursiveMode::NonRecursive)?;
+            }
             /*
             NOTE: Using the parent directory instead of the file is a workaround.
             This workaround follows the recommendation of the notify crate authors:
@@ -153,7 +159,7 @@ impl Observer {
             let metadata = path.metadata().ok();
             self.files.insert(
                 &path,
-                PathData::new(reader, metadata, display_name),
+                PathData::new(reader, metadata, display_name, path.is_symlink()),
                 update_last,
             );
         }
@@ -291,6 +297,21 @@ impl Observer {
         Ok(())
     }
 
+    /// Open `path` again and, on Linux, watch the file it names now: a
+    /// watch on a symlink follows the link when it is added, so one added
+    /// before the link was changed still reports the old target.
+    fn reopen(&mut self, path: &Path) -> UResult<()> {
+        self.files.update_reader(path)?;
+        #[cfg(target_os = "linux")]
+        if path.is_symlink()
+            && let Some(watcher_rx) = &mut self.watcher_rx
+        {
+            let _ = watcher_rx.unwatch(path);
+            watcher_rx.watch(path, RecursiveMode::NonRecursive)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::cognitive_complexity)]
     fn handle_event(
         &mut self,
@@ -315,46 +336,51 @@ impl Observer {
             EventKind::Modify(ModifyKind::Any | ModifyKind::Metadata(MetadataKind::Any | MetadataKind::WriteTime) | ModifyKind::Data(DataChange::Any) | ModifyKind::Name(RenameMode::To)) |
             EventKind::Create(CreateKind::File | CreateKind::Folder | CreateKind::Any) => {
                 if let Ok(new_md) = event_path.metadata() {
+                    let pd = self.files.get(event_path);
                     // `metadata()` follows symlinks, so under --follow=name a
                     // watched file swapped for a symlink would otherwise be
-                    // silently followed to its target. GNU treats such a
-                    // replacement as untailable.
+                    // silently followed to its target, and is treated as
+                    // untailable instead. A path that already was a symlink
+                    // is followed to its target, as GNU does.
                     let replaced_by_symlink = self.follow_name()
+                        && !pd.symlink
                         && event_path
                             .symlink_metadata()
                             .is_ok_and(|m| m.file_type().is_symlink());
                     let is_tailable = !replaced_by_symlink && new_md.is_tailable();
-                    let pd = self.files.get(event_path);
                     if let Some(old_md) = &pd.metadata {
                         if is_tailable {
-                            // We resume tracking from the start of the file,
-                            // assuming it has been truncated to 0. This mimics GNU's `tail`
-                            // behavior and is the usual truncation operation for log files.
+                            // The path was untailable (missing, or not a
+                            // regular file) and has become tailable again:
+                            // open the new file and read it from the start.
                             if !old_md.is_tailable() {
                                 show_error!(
                                     "{}",
                                     translate!("tail-status-has-become-accessible", "file" => display_name.quote())
                                 );
-                                self.files.update_reader(event_path)?;
+                                self.reopen(event_path)?;
                             } else if pd.reader.is_none() {
                                 show_error!(
                                     "{}",
                                     translate!("tail-status-has-appeared-following-new-file", "file" => display_name.quote())
                                 );
-                                self.files.update_reader(event_path)?;
+                                self.reopen(event_path)?;
                             } else if event.kind == EventKind::Modify(ModifyKind::Name(RenameMode::To))
                             || (self.use_polling && !old_md.file_id_eq(&new_md)) {
                                 show_error!(
                                     "{}",
                                     translate!("tail-status-has-been-replaced-following-new-file", "file" => display_name.quote())
                                 );
-                                self.files.update_reader(event_path)?;
+                                self.reopen(event_path)?;
                             } else if old_md.got_truncated(&new_md)? {
+                                // A file that has lost content is read again
+                                // from offset zero, since shortening a log
+                                // almost always means it was emptied outright.
                                 show_error!(
                                     "{}",
-                                    translate!("tail-status-file-truncated", "file" => display_name)
+                                    translate_text!("tail-status-file-truncated", "file" => display_name)
                                 );
-                                self.files.update_reader(event_path)?;
+                                self.reopen(event_path)?;
                             }
                             paths.push(event_path.clone());
                         } else if !is_tailable && old_md.is_tailable() {
@@ -378,7 +404,7 @@ impl Observer {
                             "{}",
                             translate!("tail-status-has-appeared-following-new-file", "file" => display_name.quote())
                         );
-                        self.files.update_reader(event_path)?;
+                        self.reopen(event_path)?;
                         paths.push(event_path.clone());
                     } else if settings.retry {
                         if self.follow_descriptor() {
@@ -399,7 +425,16 @@ impl Observer {
                         }
                     }
                     self.files.update_metadata(event_path, Some(new_md));
+                } else if self.follow_descriptor() && self.files.get(event_path).reader.is_some() {
+                    // The link no longer resolves, but the file it led to is
+                    // still open and is what --follow=descriptor follows.
+                    paths.push(event_path.clone());
                 } else if event_path.is_symlink() && settings.retry {
+                    // The link no longer resolves. Say so if it was being
+                    // followed, and poll it until it resolves again.
+                    if self.files.get(event_path).reader.is_some() {
+                        report_inaccessible(&display_name);
+                    }
                     self.files.reset_reader(event_path);
                     self.orphans.push(event_path.clone());
                 }
@@ -410,12 +445,7 @@ impl Observer {
                     if settings.retry {
                         if self.files.get_mut_metadata(event_path).is_some_and(MetadataExtTail::is_tailable)
                             && self.files.get(event_path).reader.is_some() {
-                                show_error!(
-                                    "{} {}: {}",
-                                    display_name.quote(),
-                                    translate!("tail-become-inaccessible"),
-                                    translate!("tail-no-such-file-or-directory")
-                                );
+                                report_inaccessible(&display_name);
                         }
                         if !event_path.has_active_parent() && !self.orphans.contains(event_path) {
                             show_error!("{}", translate!("tail-status-directory-containing-watched-file-removed"));
@@ -425,6 +455,11 @@ impl Observer {
                             );
                             self.orphans.push(event_path.clone());
                             let _ = self.watcher_rx.as_mut().unwrap().unwatch(event_path);
+                        } else if event_path.is_symlink() && !self.orphans.contains(event_path) {
+                            // The target of the link is gone, and nothing
+                            // reports the name it will come back under: poll
+                            // the link until it resolves again.
+                            self.orphans.push(event_path.clone());
                         }
                     } else {
                         show_error!(
@@ -492,6 +527,16 @@ impl Observer {
         }
         Ok(paths)
     }
+}
+
+/// A followed name that no longer leads to a file.
+fn report_inaccessible(display_name: &str) {
+    show_error!(
+        "{} {}: {}",
+        display_name.quote(),
+        translate!("tail-become-inaccessible"),
+        translate!("tail-no-such-file-or-directory")
+    );
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -659,14 +704,11 @@ pub fn follow(mut observer: Observer, settings: &Settings) -> UResult<()> {
         if timeout_counter == settings.max_unchanged_stats {
             /*
             TODO: [2021-10; jhscheer] implement timeout_counter for each file.
-            '--max-unchanged-stats=n'
-            When tailing a file by name, if there have been n (default n=5) consecutive iterations
-            for which the file has not changed, then open/fstat the file to determine if that file
-            name is still associated with the same device/inode-number pair as before. When
-            following a log file that is rotated, this is approximately the number of seconds
-            between when tail prints the last pre-rotation lines and when it prints the lines that
-            have accumulated in the new log file. This option is meaningful only when polling
-            (i.e., without inotify) and when following by name.
+            `--max-unchanged-stats=n` counts per file, not once for the whole run:
+            a name that goes n polls (5 by default) without changing should be
+            re-opened and its device and inode compared against the handle still
+            held for it, which is how the swap behind a rotated log is noticed.
+            Only the polling path needs this, and only when following by name.
             */
         }
     }

@@ -2,11 +2,14 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore extendedbigdecimal bigdecimal numberparse hexadecimalfloat
+
 //! Parsing numbers for use in `seq`.
 //!
 //! This module provides an implementation of [`FromStr`] for the
 //! [`PreciseNumber`] struct.
+
 use std::str::FromStr;
 
 use uucore::parser::num_parser::{ExtendedParser, ExtendedParserError};
@@ -22,7 +25,7 @@ pub enum ParseNumberError {
 }
 
 /// Compute the number of integral and fractional digits in input string,
-/// and wrap the result in a PreciseNumber.
+/// and wrap the result in a [`PreciseNumber`].
 /// We know that the string has already been parsed correctly, so we don't
 /// need to be too careful.
 fn compute_num_digits(input: &str, ebd: ExtendedBigDecimal) -> PreciseNumber {

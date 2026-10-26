@@ -5,6 +5,8 @@
 
 // spell-checker:ignore powf seps replacen
 
+use std::fmt::Write as _;
+
 use uucore::display::Quotable;
 use uucore::i18n::decimal::{locale_decimal_separator, locale_grouping_separator};
 use uucore::translate;
@@ -14,6 +16,26 @@ use crate::options::{NumfmtOptions, RoundMethod, TransformOptions};
 use crate::units::{
     DisplayableSuffix, RawSuffix, Result, Suffix, Unit, iec_bases_f64, si_bases_f64,
 };
+
+/// What can go wrong while writing a formatted line: either the line itself is
+/// not convertible (which `--invalid` decides what to do with), or the output
+/// could not be written at all (which is always fatal).
+pub enum WriteError {
+    Io(std::io::Error),
+    Invalid(String),
+}
+
+impl From<std::io::Error> for WriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<String> for WriteError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
 
 fn find_numeric_beginning(s: &str) -> Option<&str> {
     let dec_sep = locale_decimal_separator();
@@ -79,7 +101,7 @@ fn find_valid_number_with_suffix(s: &str, unit: Unit) -> Option<&str> {
     }
 }
 
-/// Given a string like "5 K Field2" with unit_separator=" ", returns the length
+/// Given a string like "5 K Field2" with `unit_separator=" "`, returns the length
 /// of the valid prefix including the separator and suffix (e.g. "5 K" → 4).
 fn valid_end_with_unit_separator(
     s: &str,
@@ -204,6 +226,14 @@ fn parse_number_part(s: &str, input: &str) -> Result<ParsedNumber> {
     let dec_sep = locale_decimal_separator();
     if s.ends_with(dec_sep) {
         return Err(translate!("numfmt-error-invalid-number", "input" => input.quote()));
+    }
+
+    // GNU rejects a leading '+' and scientific notation, which Rust's parsers accept.
+    if s.starts_with('+') {
+        return Err(translate!("numfmt-error-invalid-number", "input" => input.quote()));
+    }
+    if s.bytes().any(|b| b == b'e' || b == b'E') {
+        return Err(translate!("numfmt-error-invalid-suffix", "input" => input.quote()));
     }
 
     if let Ok(n) = s.parse::<i128>() {
@@ -536,6 +566,7 @@ fn consider_suffix(
     u: Unit,
     round_method: RoundMethod,
     precision: usize,
+    is_precision_specified: bool,
 ) -> Result<(f64, Option<Suffix>)> {
     use crate::units::RawSuffix::{E, G, K, M, P, Q, R, T, Y, Z};
 
@@ -574,7 +605,10 @@ fn consider_suffix(
     } else {
         precision
     };
-    let v = if precision > 0 {
+    let v = if is_precision_specified {
+        // An explicit `--format` precision, `%.0f` included, rounds the scaled
+        // value to exactly that many decimals. `div_round` is for the default
+        // presentation instead, which keeps one decimal below the next base.
         round_with_precision(n / bases[i], round_method, effective_precision)
     } else {
         div_round(n, bases[i], round_method)
@@ -691,7 +725,7 @@ fn transform_to(
 
     let s = s.to_f64();
     let i2 = s / (opts.to_unit as f64);
-    let (i2, s) = consider_suffix(i2, opts.to, round_method, precision)?;
+    let (i2, s) = consider_suffix(i2, opts.to, round_method, precision, is_precision_specified)?;
     let dec_sep = locale_decimal_separator();
     let localize = |s: String| -> String {
         if dec_sep == "." {
@@ -701,10 +735,12 @@ fn transform_to(
         }
     };
     Ok(match s {
-        None if opts.to == Unit::None && precision <= u16::MAX.into() => localize(format_float(
-            round_with_precision(i2, round_method, precision),
-            precision,
-        )),
+        None if opts.to == Unit::None && precision <= u16::MAX.into() => {
+            let rounded = round_with_precision(i2, round_method, precision);
+            // rounding a small negative number leaves -0.0, which would print as "-0"
+            let rounded = if rounded == 0.0 { 0.0 } else { rounded };
+            localize(format_float(rounded, precision))
+        }
         None if is_precision_specified && precision <= u16::MAX.into() => {
             let i2 = round_with_precision(i2, round_method, 0);
             localize(format_float(i2, precision))
@@ -752,6 +788,18 @@ fn pad_string(s: &str, width: usize, fill: char, right_align: bool) -> String {
         result.extend(std::iter::repeat_n(fill, pad));
     }
     result
+}
+
+/// Split a scaled value into its numeric part and the unit suffix that trails
+/// it (`k`, `Mi`, ...).
+///
+/// A value with no digits at all, such as `inf`, has no numeric part to pad, so
+/// it is returned whole and is padded as before.
+fn split_number_and_units(s: &str) -> (&str, &str) {
+    match s.rfind(|c: char| c.is_ascii_digit()) {
+        Some(last_digit) => s.split_at(last_digit + 1),
+        None => (s, ""),
+    }
 }
 
 fn format_string(
@@ -808,11 +856,30 @@ fn format_string(
     let padded_number = match padding {
         0 => number_with_suffix,
         p if p > 0 && options.format.zero_padding => {
-            let zero_padded = if let Some(unsigned) = number_with_suffix.strip_prefix(['-', '+']) {
-                let sign = &number_with_suffix[..1];
-                format!("{sign}{}", pad_string(unsigned, p as usize - 1, '0', true))
+            // GNU zero-pads the number itself: "Optional zero (%010f) width
+            // will zero pad the number". A unit suffix from --to and the
+            // --suffix text sit outside the width, unlike space padding,
+            // which applies to the whole output.
+            // The --suffix text is user-supplied and may itself contain
+            // digits, so peel it off before locating the number.
+            let (scaled, user_suffix) = match &options.suffix {
+                Some(suffix) => number_with_suffix
+                    .strip_suffix(suffix.as_str())
+                    .map_or((number_with_suffix.as_str(), ""), |rest| {
+                        (rest, suffix.as_str())
+                    }),
+                None => (number_with_suffix.as_str(), ""),
+            };
+            let (number, unit) = split_number_and_units(scaled);
+            let trailing = format!("{unit}{user_suffix}");
+            let zero_padded = if let Some(unsigned) = number.strip_prefix(['-', '+']) {
+                let sign = &number[..1];
+                format!(
+                    "{sign}{}{trailing}",
+                    pad_string(unsigned, (p as usize).saturating_sub(1), '0', true)
+                )
             } else {
-                pad_string(&number_with_suffix, p as usize, '0', true)
+                format!("{}{trailing}", pad_string(number, p as usize, '0', true))
             };
 
             match implicit_padding.unwrap_or(options.padding) {
@@ -839,13 +906,13 @@ pub(crate) fn escape_line(line: &[u8]) -> String {
     for chunk in line.utf8_chunks() {
         for c in chunk.valid().chars() {
             if c.is_ascii() && !c.is_ascii_graphic() && !c.is_ascii_whitespace() {
-                result.push_str(&format!("\\{:03o}", c as u8));
+                let _ = write!(result, "\\{:03o}", c as u8);
             } else {
                 result.push(c);
             }
         }
         for &b in chunk.invalid() {
-            result.push_str(&format!("\\{b:03o}"));
+            let _ = write!(result, "\\{b:03o}");
         }
     }
     result
@@ -873,7 +940,7 @@ pub fn write_formatted_with_delimiter<W: std::io::Write + ?Sized>(
     input: &[u8],
     options: &NumfmtOptions,
     eol: Option<u8>,
-) -> Result<()> {
+) -> std::result::Result<(), WriteError> {
     let delimiter = options.delimiter.as_deref().unwrap();
 
     for (n, field) in (1..).zip(split_bytes(input, delimiter)) {
@@ -881,7 +948,7 @@ pub fn write_formatted_with_delimiter<W: std::io::Write + ?Sized>(
 
         // add delimiter before second and subsequent fields
         if n > 1 {
-            writer.write_all(delimiter).unwrap();
+            writer.write_all(delimiter)?;
         }
 
         if field_selected {
@@ -890,18 +957,28 @@ pub fn write_formatted_with_delimiter<W: std::io::Write + ?Sized>(
                 .map_err(|_| translate!("numfmt-error-invalid-number", "input" => escape_line(field).quote()))?
                 .trim_start();
             let formatted = format_string(field_str, options, None)?;
-            writer.write_all(formatted.as_bytes()).unwrap();
+            writer.write_all(formatted.as_bytes())?;
         } else {
             // add unselected field without conversion
-            writer.write_all(field).unwrap();
+            writer.write_all(field)?;
         }
     }
 
     if let Some(eol) = eol {
-        writer.write_all(&[eol]).unwrap();
+        writer.write_all(&[eol])?;
     }
 
     Ok(())
+}
+
+/// Writes the space that stands for the first of the `blanks` between two
+/// fields, and returns the blanks that follow it.
+fn write_separator<'a, W: std::io::Write + ?Sized>(
+    writer: &mut W,
+    blanks: &'a str,
+) -> std::io::Result<&'a str> {
+    writer.write_all(b" ")?;
+    Ok(&blanks[blanks.chars().next().map_or(0, char::len_utf8)..])
 }
 
 pub fn write_formatted_with_whitespace<W: std::io::Write + ?Sized>(
@@ -909,7 +986,7 @@ pub fn write_formatted_with_whitespace<W: std::io::Write + ?Sized>(
     s: &str,
     options: &NumfmtOptions,
     eol: Option<u8>,
-) -> Result<()> {
+) -> std::result::Result<(), WriteError> {
     for (n, (prefix, field)) in (1..).zip(WhitespaceSplitter {
         s: Some(s),
         options,
@@ -921,8 +998,7 @@ pub fn write_formatted_with_whitespace<W: std::io::Write + ?Sized>(
 
             // add delimiter before second and subsequent fields
             let prefix = if n > 1 {
-                writer.write_all(b" ").unwrap();
-                &prefix[prefix.chars().next().map_or(0, char::len_utf8)..]
+                write_separator(writer, prefix)?
             } else {
                 prefix
             };
@@ -934,23 +1010,45 @@ pub fn write_formatted_with_whitespace<W: std::io::Write + ?Sized>(
             };
 
             let formatted = format_string(field, options, implicit_padding)?;
-            writer.write_all(formatted.as_bytes()).unwrap();
+            writer.write_all(formatted.as_bytes())?;
         } else {
-            // the -z option converts an initial \n into a space
-            let prefix = if options.zero_terminated && prefix.starts_with('\n') {
-                writer.write_all(b" ").unwrap();
-                &prefix[1..]
+            // the first blank between fields is written as a space
+            let prefix = if n > 1 {
+                write_separator(writer, prefix)?
             } else {
                 prefix
             };
             // add unselected field without conversion
-            writer.write_all(prefix.as_bytes()).unwrap();
-            writer.write_all(field.as_bytes()).unwrap();
+            writer.write_all(prefix.as_bytes())?;
+            writer.write_all(field.as_bytes())?;
         }
     }
 
     if let Some(eol) = eol {
-        writer.write_all(&[eol]).unwrap();
+        writer.write_all(&[eol])?;
+    }
+
+    Ok(())
+}
+
+/// Writes a line that could not be converted, with the blanks between its
+/// fields written as `write_formatted_with_whitespace` writes them.
+pub fn write_unconverted_with_whitespace<W: std::io::Write + ?Sized>(
+    writer: &mut W,
+    s: &str,
+    options: &NumfmtOptions,
+) -> std::io::Result<()> {
+    for (n, (prefix, field)) in (1..).zip(WhitespaceSplitter {
+        s: Some(s),
+        options,
+    }) {
+        let prefix = if n > 1 {
+            write_separator(writer, prefix)?
+        } else {
+            prefix
+        };
+        writer.write_all(prefix.as_bytes())?;
+        writer.write_all(field.as_bytes())?;
     }
 
     Ok(())
@@ -1208,7 +1306,7 @@ mod tests {
         use crate::options::RoundMethod;
         use crate::units::Unit;
 
-        let result = consider_suffix(1e27, Unit::Si, RoundMethod::FromZero, 0);
+        let result = consider_suffix(1e27, Unit::Si, RoundMethod::FromZero, 0, false);
         assert!(result.is_ok());
         let (value, suffix) = result.unwrap();
         assert!(suffix.is_some());
@@ -1216,7 +1314,7 @@ mod tests {
         assert_eq!(raw_suffix as i32, RawSuffix::R as i32);
         assert_eq!(value, 1.0);
 
-        let result = consider_suffix(1e30, Unit::Si, RoundMethod::FromZero, 0);
+        let result = consider_suffix(1e30, Unit::Si, RoundMethod::FromZero, 0, false);
         assert!(result.is_ok());
         let (value, suffix) = result.unwrap();
         assert!(suffix.is_some());
@@ -1224,7 +1322,7 @@ mod tests {
         assert_eq!(raw_suffix as i32, RawSuffix::Q as i32);
         assert_eq!(value, 1.0);
 
-        let result = consider_suffix(5e30, Unit::Si, RoundMethod::FromZero, 0);
+        let result = consider_suffix(5e30, Unit::Si, RoundMethod::FromZero, 0, false);
         assert!(result.is_ok());
         let (value, suffix) = result.unwrap();
         assert!(suffix.is_some());

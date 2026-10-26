@@ -2,9 +2,12 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
+// spell-checker:ignore dirlink
+
 #![allow(clippy::similar_names)]
 
-use std::path::PathBuf;
+use std::path::{MAIN_SEPARATOR_STR, PathBuf};
 #[cfg(all(unix, not(target_os = "android")))]
 use std::time::Duration;
 use uutests::at_and_ucmd;
@@ -30,6 +33,31 @@ fn test_symlink_existing_file() {
     assert!(at.file_exists(file));
     assert!(at.is_symlink(link));
     assert_eq!(at.resolve_link(link), file);
+}
+
+#[test]
+#[cfg(windows)]
+fn test_symlink_target_with_forward_slashes() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir_all("dir/sub");
+    at.write("dir/file", "content");
+
+    scene
+        .ucmd()
+        .args(&["-s", "dir/file", "link"])
+        .succeeds()
+        .no_stderr();
+    assert_eq!(at.resolve_link("link"), "dir\\file");
+    assert_eq!(at.read("link"), "content");
+
+    scene
+        .ucmd()
+        .args(&["-s", "dir/sub", "dirlink"])
+        .succeeds()
+        .no_stderr();
+    assert_eq!(at.resolve_link("dirlink"), "dir\\sub");
+    assert!(at.dir_exists("dirlink"));
 }
 
 #[test]
@@ -111,6 +139,127 @@ fn test_symlink_overwrite_force() {
     ucmd.args(&["--force", "-s", file_b, link]).succeeds();
     assert!(at.is_symlink(link));
     assert_eq!(at.resolve_link(link), file_b);
+}
+
+/// A forced replace must be atomic, so a concurrent creator always loses.
+/// Fails reliably if unlink-then-create ever comes back.
+#[test]
+// Android's app-private filesystem refuses hard links.
+#[cfg(all(unix, not(any(target_os = "redox", target_os = "android"))))]
+#[cfg_attr(wasi_runner, ignore)]
+fn test_force_replace_never_leaves_the_destination_name_free() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for symbolic in [true, false] {
+        let scene = TestScenario::new(util_name!());
+        let at = &scene.fixtures;
+        at.touch("a");
+        at.touch("b");
+        if symbolic {
+            at.symlink_file("a", "link");
+        } else {
+            at.hard_link("a", "link");
+        }
+
+        let target = at.plus("link");
+        let stop = Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
+
+        let (racer_stop, racer_claimed) = (stop.clone(), claimed.clone());
+        let racer = std::thread::spawn(move || {
+            while !racer_stop.load(Ordering::Relaxed) {
+                // Succeeds only if the name is unoccupied at this instant.
+                if std::os::unix::fs::symlink("claimed-by-attacker", &target).is_ok() {
+                    racer_claimed.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
+
+        for _ in 0..100 {
+            let mut args = vec!["--force"];
+            if symbolic {
+                args.push("-s");
+            }
+            args.extend_from_slice(&["b", "link"]);
+            scene.ucmd().args(&args).succeeds();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        racer.join().unwrap();
+
+        assert!(
+            !claimed.load(Ordering::Relaxed),
+            "destination name was unoccupied during a forced replace (symbolic={symbolic})"
+        );
+    }
+}
+
+/// Replacing a destination that is already a link to the same inode leaves
+/// `rename` with nothing to do, and the temporary must not survive that.
+#[test]
+// Android's app-private filesystem refuses hard links.
+#[cfg(all(unix, not(any(target_os = "redox", target_os = "android"))))]
+fn test_force_replace_same_inode_leaves_no_temp_file() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.touch("a");
+    at.hard_link("a", "b");
+
+    scene.ucmd().args(&["--force", "a", "b"]).succeeds();
+
+    let leftovers: Vec<_> = std::fs::read_dir(at.as_string())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|name| name != "a" && name != "b")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "forced replace left a temporary behind: {leftovers:?}"
+    );
+}
+
+/// The destination can sit inside a directory reached through a symlink, as
+/// when the target argument is a symlink to a directory. The replace must
+/// follow it the same way the first create attempt does.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: creating a link inside a symlinked directory is denied"
+)]
+fn test_force_replace_in_symlinked_directory() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("real");
+    at.symlink_dir("real", "dirlink");
+    at.symlink_file("old", "real/link");
+
+    ucmd.args(&["-s", "-f", "new", "dirlink/link"]).succeeds();
+
+    assert_eq!(at.resolve_link("real/link"), "new");
+}
+
+/// Same as above for a hard link, which goes through the same replace path.
+#[test]
+// Android's app-private filesystem refuses hard links.
+#[cfg(all(unix, not(any(target_os = "redox", target_os = "android"))))]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: creating a link inside a symlinked directory is denied"
+)]
+fn test_force_replace_hard_link_in_symlinked_directory() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("new");
+    at.mkdir("real");
+    at.symlink_dir("real", "dirlink");
+    at.touch("real/link");
+
+    ucmd.args(&["-f", "new", "dirlink/link"]).succeeds();
+
+    assert_eq!(at.metadata("real/link").ino(), at.metadata("new").ino());
 }
 
 #[test]
@@ -196,6 +345,43 @@ fn test_symlink_interactive_overrides_force() {
 }
 
 #[test]
+fn test_symlink_interactive_backup_declined() {
+    for (dest, replaced) in [
+        ("old", PathBuf::from("old")),
+        ("dir", PathBuf::from("dir").join("new")),
+    ] {
+        let replaced = replaced.to_str().unwrap();
+        let scene = TestScenario::new(util_name!());
+        let at = &scene.fixtures;
+        at.mkdir("dir");
+        at.write("new", "new");
+        at.write("old", "old");
+        at.write("dir/new", "old");
+
+        scene
+            .ucmd()
+            .args(&["-s", "-i", "-b", "new", dest])
+            .pipe_in("n")
+            .fails()
+            .stderr_only(format!("ln: replace '{replaced}'? "));
+
+        assert_eq!(at.read(replaced), "old");
+        assert!(!at.file_exists(format!("{replaced}~")));
+    }
+}
+
+#[test]
+fn test_symlink_force_backup_same_file() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("file", "content");
+
+    ucmd.args(&["-s", "-f", "-b", "file", "file"]).succeeds();
+
+    assert_eq!(at.resolve_link("file"), "file");
+    assert_eq!(at.read("file~"), "content");
+}
+
+#[test]
 fn test_symlink_simple_backup() {
     let (at, mut ucmd) = at_and_ucmd!();
     let file = "test_symlink_simple_backup";
@@ -244,6 +430,25 @@ fn test_symlink_custom_backup_suffix() {
     let backup = &format!("{link}{suffix}");
     assert!(at.is_symlink(backup));
     assert_eq!(at.resolve_link(backup), file);
+}
+
+#[test]
+#[cfg(not(target_os = "android"))]
+fn test_ln_backup_empty_suffix_defaults_to_tilde() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+
+    at.write("a", "a\n");
+    at.write("b", "b2\n");
+
+    scene
+        .ucmd()
+        .args(&["-b", "--suffix=", "a", "b"])
+        .succeeds()
+        .no_stderr();
+
+    assert_eq!(at.read("b"), "a\n");
+    assert_eq!(at.read("b~"), "b2\n");
 }
 
 #[test]
@@ -450,11 +655,17 @@ fn test_symlink_target_dir_from_dir() {
 
     let file_a_link = &format!("{dir}/{filename_a}");
     assert!(at.is_symlink(file_a_link));
-    assert_eq!(&at.resolve_link(file_a_link), file_a);
+    assert_eq!(
+        at.resolve_link(file_a_link),
+        file_a.replace('/', MAIN_SEPARATOR_STR)
+    );
 
     let file_b_link = &format!("{dir}/{filename_b}");
     assert!(at.is_symlink(file_b_link));
-    assert_eq!(&at.resolve_link(file_b_link), file_b);
+    assert_eq!(
+        at.resolve_link(file_b_link),
+        file_b.replace('/', MAIN_SEPARATOR_STR)
+    );
 }
 
 #[test]
@@ -635,7 +846,10 @@ fn test_symlink_relative_path() {
         .succeeds()
         .stdout_only(format!("'{link}' -> '{}'\n", p.to_string_lossy()));
     assert!(at.is_symlink(link));
-    assert_eq!(at.resolve_link(link), p.to_string_lossy());
+    assert_eq!(
+        at.resolve_link(link),
+        p.to_string_lossy().replace('/', MAIN_SEPARATOR_STR)
+    );
 }
 
 #[test]
@@ -853,6 +1067,42 @@ fn test_backup_same_file() {
     ucmd.args(&["--backup", "file1", "./file1"])
         .fails()
         .stderr_contains("n: 'file1' and './file1' are the same file");
+}
+
+#[test]
+fn test_backup_simple_numbered_same_file() {
+    for backup in ["--backup=simple", "--backup=numbered"] {
+        for args in [
+            vec![backup, "a", "a"],
+            vec!["-f", backup, "a", "a"],
+            vec!["-f", backup, "./a", "a"],
+        ] {
+            let (at, mut ucmd) = at_and_ucmd!();
+            at.write("a", "content");
+
+            ucmd.args(&args)
+                .fails_with_code(1)
+                .stderr_contains("are the same file");
+
+            assert_eq!(at.read("a"), "content");
+            assert!(!at.file_exists("a~"));
+            assert!(!at.file_exists("a.~1~"));
+        }
+    }
+}
+
+#[test]
+fn test_backup_simple_same_file_into_directory() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("d");
+    at.write("d/a", "content");
+
+    ucmd.args(&["-f", "--backup=simple", "d/a", "d"])
+        .fails_with_code(1)
+        .stderr_contains("are the same file");
+
+    assert_eq!(at.read("d/a"), "content");
+    assert!(!at.file_exists("d/a~"));
 }
 
 #[test]
@@ -1164,7 +1414,9 @@ fn test_ln_no_dereference_symbolic() {
         .ucmd()
         .args(&["-n", "x", "b"])
         .fails()
-        .stderr_contains("Already exists");
+        .stderr_contains("failed to create hard link 'b'")
+        // strerror(EEXIST), as GNU prints it
+        .stderr_contains("File exists");
     assert!(!at.file_exists("a/x"));
     #[cfg(not(target_os = "android"))]
     {
@@ -1189,4 +1441,16 @@ fn test_ln_backup_nonexistent_rollback() {
 
     assert!(!at.file_exists("dst~"));
     assert!(at.file_exists("dst"));
+}
+
+#[test]
+fn test_hard_link_force_failed_link_keeps_destination() {
+    // Regression for #14550: a failed forced link must not delete the destination.
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("dst", "keep\n");
+
+    ucmd.args(&["-f", "no_such_source", "dst"]).fails();
+
+    assert!(at.file_exists("dst"));
+    assert_eq!(at.read("dst"), "keep\n");
 }

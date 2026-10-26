@@ -24,7 +24,6 @@ use std::fs::{File, metadata};
 use std::io;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write, stdin};
 use std::path::Path;
-use thiserror::Error;
 use uucore::display::Quotable;
 use uucore::error::{FromIo, UResult, USimpleError, UUsageError, set_exit_code, strip_errno};
 use uucore::parser::parse_size::parse_size_u64;
@@ -58,7 +57,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     // When using --filter, we write to a child process's stdin which may
     // close early. Disable SIGPIPE so we get EPIPE errors instead of
     // being terminated, allowing graceful handling of broken pipes.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "fuchsia")))]
     if settings.filter.is_some() {
         let _ = uucore::signals::disable_pipe_errors();
     }
@@ -76,6 +75,7 @@ fn handle_obsolete(args: impl uucore::Args) -> (Vec<OsString>, Option<String>) {
     let mut obs_lines = None;
     let mut preceding_long_opt_req_value = false;
     let mut preceding_short_opt_req_value = false;
+    let mut after_double_dash = false;
 
     let filtered_args = args
         .filter_map(|os_slice| {
@@ -84,6 +84,7 @@ fn handle_obsolete(args: impl uucore::Args) -> (Vec<OsString>, Option<String>) {
                 &mut obs_lines,
                 &mut preceding_long_opt_req_value,
                 &mut preceding_short_opt_req_value,
+                &mut after_double_dash,
             )
         })
         .collect();
@@ -98,9 +99,19 @@ fn filter_args(
     obs_lines: &mut Option<String>,
     preceding_long_opt_req_value: &mut bool,
     preceding_short_opt_req_value: &mut bool,
+    after_double_dash: &mut bool,
 ) -> Option<OsString> {
     let filter: Option<OsString>;
     if let Some(slice) = os_slice.to_str() {
+        if *after_double_dash {
+            // Past `--` everything is an operand, so `split -- -1` names a file
+            // rather than setting the line count.
+            return Some(OsString::from(slice));
+        }
+        if slice == "--" {
+            *after_double_dash = true;
+            return Some(OsString::from(slice));
+        }
         if should_extract_obs_lines(
             slice,
             *preceding_long_opt_req_value,
@@ -246,8 +257,8 @@ struct Settings {
     io_blksize: Option<u64>,
 }
 
-#[derive(Debug, Error)]
 /// An error when parsing settings from command-line arguments.
+#[derive(Debug, thiserror::Error)]
 enum SettingsError {
     /// Invalid chunking strategy.
     #[error("{0}")]
@@ -322,7 +333,7 @@ impl Settings {
             if let Some(s) = matches.get_one::<String>(options::IO_BLKSIZE) {
                 match parse_size_u64(s) {
                     Ok(0) => return Err(SettingsError::InvalidIOBlockSize(s.to_owned())),
-                    Ok(n) if n <= uucore::fs::sane_blksize::MAX => Some(n),
+                    Ok(n @ ..=uucore::fs::sane_blksize::MAX) => Some(n),
                     _ => return Err(SettingsError::InvalidIOBlockSize(s.to_owned())),
                 }
             } else {
@@ -413,6 +424,11 @@ fn custom_write_all<T: Write>(
     }
 }
 
+struct InputSize {
+    size: u64,
+    spooled: Option<File>,
+}
+
 /// Get the size of the input file in bytes
 /// Used only for subset of `--number=CHUNKS` strategy, as there is a need
 /// to determine input file size upfront in order to estimate the chunk size
@@ -429,9 +445,8 @@ fn custom_write_all<T: Write>(
 /// their actual content size, we will need to attempt to find the end of file
 /// with direct `seek()` on [`std::fs::File`].
 ///
-/// For STDIN stream - read into a buffer up to a limit
-/// If input stream does not EOF before that - return an error
-/// (i.e. "infinite" input as in `cat /dev/zero | split ...`, `yes | split ...` etc.).
+/// For STDIN stream - read into a buffer up to a limit. If the stream does not reach EOF,
+/// spool it to a temporary file so its size can be determined without keeping it in memory.
 ///
 /// Note: The `buf` might end up with either partial or entire input content.
 fn get_input_size(
@@ -439,7 +454,7 @@ fn get_input_size(
     reader: &mut impl Read,
     buf: &mut Vec<u8>,
     io_blksize: Option<u64>,
-) -> io::Result<u64> {
+) -> io::Result<InputSize> {
     // Set read limit to io_blksize if specified
     let read_limit: u64 = if let Some(custom_blksize) = io_blksize {
         custom_blksize
@@ -462,20 +477,31 @@ fn get_input_size(
         // empty STDIN stream,
         // and files with true file size 0
         // will also fit here
-        Ok(num_bytes)
+        Ok(InputSize {
+            size: num_bytes,
+            spooled: None,
+        })
     } else if input == "-" {
-        // STDIN stream that did not fit all content into a buffer
-        // Most likely continuous/infinite input stream
-        Err(io::Error::other(
-            translate!("split-error-cannot-determine-input-size", "input" => input.maybe_quote()),
-        ))
+        // STDIN stream that did not fit into the buffer. Spool it so the
+        // size-dependent --number strategies can read it again.
+        let mut spooled = tempfile::tempfile()?;
+        spooled.write_all(buf)?;
+        let size = num_bytes + io::copy(reader, &mut spooled)?;
+        spooled.seek(SeekFrom::Start(0))?;
+        Ok(InputSize {
+            size,
+            spooled: Some(spooled),
+        })
     } else {
         // Could be that file size is larger than set read limit
         // Get the file size from filesystem metadata
         let metadata = metadata(Path::new(input))?;
         let metadata_size = metadata.len();
         if num_bytes <= metadata_size {
-            Ok(metadata_size)
+            Ok(InputSize {
+                size: metadata_size,
+                spooled: None,
+            })
         } else {
             // Could be a file from locations like /dev, /sys, /proc or similar
             // which report filesystem metadata size that does not match
@@ -484,7 +510,10 @@ fn get_input_size(
             let mut tmp_fd = File::open(Path::new(input))?;
             let end = tmp_fd.seek(SeekFrom::End(0))?;
             if end > 0 {
-                Ok(end)
+                Ok(InputSize {
+                    size: end,
+                    spooled: None,
+                })
             } else {
                 // Edge case of either "infinite" file (i.e. /dev/zero)
                 // or some other "special" non-standard file type
@@ -943,8 +972,13 @@ fn n_chunks_by_byte(
 ) -> UResult<()> {
     // Get the size of the input in bytes
     let initial_buf = &mut Vec::new();
-    let mut num_bytes = get_input_size(&settings.input, reader, initial_buf, settings.io_blksize)?;
-    let mut reader = initial_buf.chain(reader);
+    let InputSize { size, spooled } =
+        get_input_size(&settings.input, reader, initial_buf, settings.io_blksize)?;
+    let mut num_bytes = size;
+    let mut reader: Box<dyn Read> = match spooled {
+        Some(file) => Box::new(file),
+        None => Box::new(initial_buf.chain(reader)),
+    };
 
     // If input file is empty and we would not have determined the Kth chunk
     // in the Kth chunk of N chunk mode, then terminate immediately.
@@ -1075,13 +1109,19 @@ fn n_chunks_by_line(
     // Get the size of the input in bytes and compute the number
     // of bytes per chunk.
     let initial_buf = &mut Vec::new();
-    let num_bytes = get_input_size(
+    let InputSize {
+        size: num_bytes,
+        spooled,
+    } = get_input_size(
         &settings.input,
         &mut reader,
         initial_buf,
         settings.io_blksize,
     )?;
-    let reader = initial_buf.chain(reader);
+    let reader: Box<dyn BufRead> = match spooled {
+        Some(file) => Box::new(BufReader::with_capacity(io_blksize, file)),
+        None => Box::new(initial_buf.chain(reader)),
+    };
 
     // If input file is empty and we would not have determined the Kth chunk
     // in the Kth chunk of N chunk mode, then terminate immediately.
@@ -1148,20 +1188,28 @@ fn n_chunks_by_line(
         // empty files in place(s) of skipped chunk(s)
         let num_line_bytes = bytes.len() as u64;
         num_bytes_written += num_line_bytes;
-        let mut skipped = -1;
-        while num_bytes_should_be_written <= num_bytes_written {
-            num_bytes_should_be_written +=
-                chunk_size_base + (chunk_size_reminder > chunk_number) as u64;
+        let first_chunk_number = chunk_number;
+        // Cap at the last chunk to avoid an infinite loop when trailing chunks are
+        // zero-sized, and keep excess input from indexing past out_files.
+        while chunk_number < num_chunks && num_bytes_should_be_written <= num_bytes_written {
+            let chunk_size = chunk_size_base + (chunk_size_reminder > chunk_number) as u64;
+            if chunk_size == 0 {
+                // Every remaining chunk is zero-sized as well, so all of them
+                // would be skipped one at a time, which takes prohibitively
+                // long for a huge number of chunks. Jump to the last one.
+                chunk_number = num_chunks;
+                break;
+            }
+            num_bytes_should_be_written += chunk_size;
             chunk_number += 1;
-            skipped += 1;
         }
 
         // If a chunk was skipped and `elide_empty_files` flag is set,
         // roll chunk_number back to preserve sequential continuity
         // of file names for files written to,
         // except for Kth chunk of N mode
-        if settings.elide_empty_files && skipped > 0 && kth_chunk.is_none() {
-            chunk_number -= skipped as u64;
+        if settings.elide_empty_files && kth_chunk.is_none() {
+            chunk_number = chunk_number.min(first_chunk_number + 1);
         }
         if kth_chunk.is_some_and(|k| chunk_number > k) {
             break;
@@ -1226,9 +1274,10 @@ fn n_chunks_by_line_round_robin(
     let mut closed_writers = 0;
 
     let mut i = 0;
+    let mut line = Vec::new();
     loop {
-        let line = &mut Vec::new();
-        let num_bytes_read = reader.by_ref().read_until(sep, line)?;
+        line.clear();
+        let num_bytes_read = reader.by_ref().read_until(sep, &mut line)?;
 
         // if there is nothing else to read - exit the loop
         if num_bytes_read == 0 {
@@ -1366,7 +1415,7 @@ fn line_bytes(
 }
 
 fn split(settings: &Settings) -> UResult<()> {
-    let mut reader = if settings.input == "-" {
+    let reader = if settings.input == "-" {
         Box::new(stdin()) as Box<dyn Read>
     } else {
         let r = File::open(Path::new(&settings.input)).map_err_context(
@@ -1377,6 +1426,17 @@ fn split(settings: &Settings) -> UResult<()> {
         Box::new(r) as Box<dyn Read>
     };
     let io_blksize: usize = settings.io_blksize.unwrap_or(8 * 1024).try_into().unwrap();
+    let mut reader = BufReader::with_capacity(io_blksize, reader);
+
+    // Fixed-size modes only open an output when there is data to split.
+    // Keep the first block buffered so the selected strategy can consume it.
+    if matches!(
+        settings.strategy,
+        Strategy::Lines(_) | Strategy::Bytes(_) | Strategy::LineBytes(_)
+    ) && reader.fill_buf()?.is_empty()
+    {
+        return Ok(());
+    }
 
     match settings.strategy {
         Strategy::Number(NumberType::Bytes(num_chunks)) => {

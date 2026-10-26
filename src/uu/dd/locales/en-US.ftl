@@ -10,7 +10,7 @@ dd-after-help = Operands:
     - ibs=N : the size of buffer used for reads (default: 512)
     - if=FILE : the file used for input. When not specified, stdin is used instead
     - iflag=FLAGS : a comma-separated list of input flags which specify how the input source is treated. FLAGS may be any of the input-flags or general-flags specified below.
-    - skip=N (or iseek=N) : skip N ibs-sized records into input before beginning copy/convert operations. See iflag=seek_bytes if seeking N bytes is preferred.
+    - skip=N (or iseek=N) : skip N ibs-sized records into input before beginning copy/convert operations. See iflag=skip_bytes if seeking N bytes is preferred.
     - obs=N : the size of buffer used for writes (default: 512)
     - of=FILE : the file used for output. When not specified, stdout is used instead
     - oflag=FLAGS : comma separated list of output flags which specify how the output source is treated. FLAGS may be any of the output flags or general flags specified below
@@ -44,12 +44,13 @@ dd-after-help = Operands:
     - unblock : for each block of input of the size indicated by cbs=BYTES, remove right-trailing spaces and replace with a newline character.
     - sparse : attempts to seek the output when an obs-sized block consists of only zeros.
     - swab : swaps each adjacent pair of bytes. If an odd number of bytes is present, the final byte is omitted.
-    - sync : pad each ibs-sided block with zeros. If block or unblock is specified, pad with spaces instead.
+    - sync : pad each ibs-sized block with zeros. If block or unblock is specified, pad with spaces instead.
     - excl : the output file must be created. Fail if the output file is already present.
     - nocreat : the output file will not be created. Fail if the output file is not already present.
     - notrunc : the output file will not be truncated. If this option is not present, output will be truncated when opened.
     - noerror : all read errors will be ignored. If this option is not present, dd will only ignore Error::Interrupted.
-    - fdatasync : data will be written before finishing.  - fsync : data and metadata will be written before finishing.
+    - fdatasync : data will be written before finishing.
+    - fsync : data and metadata will be written before finishing.
 
   Input flags:
 
@@ -72,7 +73,7 @@ dd-after-help = Operands:
     - noatime : do not update access time.
     - nocache : request that OS drop cache.
     - noctty : do not assign a controlling tty.
-    - nofollow : do not follow system links.
+    - nofollow : do not follow symbolic links.
 
 # Common strings
 dd-standard-input = 'standard input'
@@ -82,6 +83,7 @@ dd-standard-output = 'standard output'
 dd-error-failed-to-open = failed to open { $path }
 dd-error-write-error = write error
 dd-error-failed-to-seek = failed to seek in output file
+dd-error-failed-to-truncate = failed to truncate to { $size } bytes in output file { $file }
 dd-error-io-error = IO error
 dd-error-cannot-skip-offset = '{ $file }': cannot skip to specified offset
 dd-error-cannot-skip-invalid = '{ $file }': cannot skip: Invalid argument
@@ -90,20 +92,20 @@ dd-error-not-directory = setting flags for '{ $file }': Not a directory
 dd-error-failed-discard-cache = failed to discard cache for: { $file }
 
 # Parse errors
-dd-error-unrecognized-operand = Unrecognized operand '{ $operand }'
-dd-error-multiple-format-table = Only one of conv=ascii conv=ebcdic or conv=ibm may be specified
-dd-error-multiple-case = Only one of conv=lcase or conv=ucase may be specified
-dd-error-multiple-block = Only one of conv=block or conv=unblock may be specified
-dd-error-multiple-excl = Only one ov conv=excl or conv=nocreat may be specified
-dd-error-invalid-flag = invalid input flag: ‘{ $flag }’
-dd-error-conv-flag-no-match = Unrecognized conv=CONV -> { $flag }
+dd-error-unrecognized-operand = unrecognized operand '{ $operand }'
+dd-error-multiple-format-table = cannot combine any two of {"{"}ascii,ebcdic,ibm{"}"}
+dd-error-multiple-case = cannot combine lcase and ucase
+dd-error-multiple-block = cannot combine block and unblock
+dd-error-multiple-excl = cannot combine excl and nocreat
+dd-error-invalid-flag = invalid input flag: '{ $flag }'
+dd-error-invalid-output-flag = invalid output flag: '{ $flag }'
+dd-error-conv-flag-no-match = invalid conversion: '{ $flag }'
 dd-error-multiplier-parse-failure = invalid number: '{ $input }'
 dd-error-multiplier-overflow = Multiplier string would overflow on current system -> { $input }
-dd-error-block-without-cbs = conv=block or conv=unblock specified without cbs=N
-dd-error-status-not-recognized = status=LEVEL not recognized -> { $level }
+dd-error-status-not-recognized = invalid status level: '{ $level }'
 dd-error-unimplemented = feature not implemented on this system -> { $feature }
 dd-error-bs-out-of-range = { $param }=N cannot fit into memory
-dd-error-invalid-number = invalid number: ‘{ $input }’
+dd-error-invalid-number = invalid number: '{ $input }'
 
 # Progress messages
 dd-progress-records-in = { $complete }+{ $partial } records in
@@ -123,6 +125,11 @@ dd-warning-signal-handler = Internal dd Warning: Unable to register signal handl
 
 # Diagnostics
 dd-diag-help-operand = an operand is KEY=VALUE, as in if=file bs=4k count=10
-dd-diag-help-flags = conv=, iflag= and oflag= take flags separated by commas, as in conv=ucase,sync
+dd-diag-label-conv = not a known conversion
+dd-diag-label-iflag = not a known input flag
+dd-diag-label-oflag = not a known output flag
+dd-diag-help-conv = conv= is one of ascii, ebcdic, ibm, lcase, ucase, block, unblock, swab, sync, noerror, sparse, excl, nocreat, notrunc, fdatasync or fsync
+dd-diag-help-iflag = iflag= is one of direct, directory, dsync, sync, nocache, nonblock, noatime, noctty, nofollow, fullblock, count_bytes or skip_bytes
+dd-diag-help-oflag = oflag= is one of direct, directory, dsync, sync, nocache, nonblock, noatime, noctty, nofollow, append or seek_bytes
 dd-diag-help-status = status= is one of none, noxfer or progress
 dd-diag-help-number = a number may be followed by a multiplier: c, w, b, then K, M, G and so on for 1024, kB, MB, GB for 1000

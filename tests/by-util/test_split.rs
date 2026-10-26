@@ -2,14 +2,13 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore xzaaa sixhundredfiftyonebytes ninetyonebytes threebytes asciilowercase ghijkl mnopq rstuv wxyz fivelines twohundredfortyonebytes onehundredlines nbbbb dxen ncccc rlimit NOFILE
 
 use rand::{RngExt as _, SeedableRng, rng};
 use regex::Regex;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 use rlimit::Resource;
-#[cfg(not(windows))]
-use std::env;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
@@ -336,27 +335,20 @@ fn test_filter() {
 #[test]
 #[cfg(unix)]
 fn test_filter_with_env_var_set() {
-    // This test will ensure that if $FILE env var was set before running --filter, it'll stay that
-    // way
+    // This test will ensure that if $FILE is already set in split's environment, --filter still
+    // sets it to each output file name
     // implemented like `test_split_default()` but run a command before writing
     let (at, mut ucmd) = at_and_ucmd!();
     let name = "filtered";
     let n_lines = 3;
     RandomFile::new(&at, name).add_lines(n_lines);
 
-    let env_var_value = "some-value";
-    unsafe {
-        env::set_var("FILE", env_var_value);
-    }
-    ucmd.args(&[format!("--filter={}", "cat > $FILE").as_str(), name])
+    ucmd.env("FILE", "some-value")
+        .args(&[format!("--filter={}", "cat > $FILE").as_str(), name])
         .succeeds();
 
     let glob = Glob::new(&at, ".", r"x[[:alpha:]][[:alpha:]]$");
     assert_eq!(glob.collate(), at.read_bytes(name));
-    assert_eq!(
-        env::var("FILE").unwrap_or_else(|_| "var was unset".to_owned()),
-        env_var_value
-    );
 }
 
 #[test]
@@ -927,6 +919,24 @@ fn test_suffix_length_zero() {
 }
 
 #[test]
+fn test_suffix_length_zero_with_number_uses_default_length() {
+    // `-a 0` is the same as no `-a`, so the suffixes start at length 2
+    // even when a shorter suffix would fit the number of chunks.
+    let (at, mut ucmd) = at_and_ucmd!();
+    ucmd.args(&["-n2", "-a0", "fivelines.txt"]).succeeds();
+    assert!(at.file_exists("xaa"));
+    assert!(at.file_exists("xab"));
+    assert!(!at.file_exists("xa"));
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    let args = ["-d", "-n10", "-a0", "fivelines.txt"];
+    ucmd.args(&args).succeeds();
+    assert!(at.file_exists("x00"));
+    assert!(at.file_exists("x09"));
+    assert!(!at.file_exists("x0"));
+}
+
+#[test]
 fn test_suffixes_exhausted() {
     new_ucmd!()
         .args(&["-b", "1", "-a", "1", "asciilowercase.txt"])
@@ -1113,11 +1123,55 @@ fn test_split_invalid_io_blksize() {
 #[test]
 fn test_split_number_oversized_stdin() {
     new_ucmd!()
-        .args(&["--number=3", "---io-blksize=600"])
+        .args(&["--number=1/4"])
         .pipe_in_fixture("sixhundredfiftyonebytes.txt")
-        .ignore_stdin_write_error()
-        .fails()
-        .stderr_only("split: -: cannot determine input size\n");
+        .succeeds()
+        .stdout_only("a".repeat(163));
+}
+
+#[test]
+fn test_split_number_by_lines_oversized_stdin() {
+    new_ucmd!()
+        .args(&["--number=l/1/4"])
+        .pipe_in("x\n".repeat(300))
+        .succeeds()
+        .stdout_only("x\n".repeat(75));
+}
+
+#[test]
+fn test_split_number_piped_stdin_files() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    scene
+        .ucmd()
+        .args(&["-n", "3"])
+        .pipe_in("a".repeat(651))
+        .succeeds()
+        .no_output();
+    assert!(at.file_exists("xaa"));
+    assert!(at.file_exists("xab"));
+    assert!(at.file_exists("xac"));
+    assert_eq!(at.read("xaa"), "a".repeat(217));
+    assert_eq!(at.read("xab"), "a".repeat(217));
+    assert_eq!(at.read("xac"), "a".repeat(217));
+}
+
+#[test]
+fn test_split_number_lines_piped_stdin_files() {
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    scene
+        .ucmd()
+        .args(&["-n", "l/3"])
+        .pipe_in("x\n".repeat(300))
+        .succeeds()
+        .no_output();
+    assert!(at.file_exists("xaa"));
+    assert!(at.file_exists("xab"));
+    assert!(at.file_exists("xac"));
+    assert_eq!(at.read("xaa"), "x\n".repeat(100));
+    assert_eq!(at.read("xab"), "x\n".repeat(100));
+    assert_eq!(at.read("xac"), "x\n".repeat(100));
 }
 
 #[test]
@@ -1273,6 +1327,35 @@ fn test_number_by_lines_kth() {
         .args(&["-n", "l/3/10", "onehundredlines.txt"])
         .succeeds()
         .stdout_only("20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n");
+}
+
+/// Chunks smaller than one byte must not loop forever.
+///
+/// When the input is shorter than the requested number of chunks, the trailing
+/// chunks are zero-sized. The chunk-advancing loop used to make no progress in
+/// that case and spun forever at 100% CPU.
+#[test]
+fn test_number_by_lines_fewer_bytes_than_chunks_elide() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("in", "a");
+    ucmd.args(&["-e", "-n", "l/3", "in"]).succeeds().no_output();
+    assert_eq!(at.read("xaa"), "a");
+    assert!(!at.plus("xab").exists());
+    assert!(!at.plus("xac").exists());
+}
+
+/// A huge chunk count must not overflow the skipped-chunk counter.
+///
+/// With far more chunks than input bytes, all of the trailing chunks are
+/// zero-sized and get skipped in one go. Counting them used to overflow and
+/// panic in a build with overflow checks enabled.
+#[test]
+fn test_number_by_lines_kth_huge_number_of_chunks() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write("in", "a");
+    ucmd.args(&["-n", "l/1/9999999999", "in"])
+        .succeeds()
+        .stdout_only("a");
 }
 
 #[test]
@@ -1666,7 +1749,6 @@ fn test_round_robin() {
 
 #[test]
 // TODO(#7542): Re-enable on Android once we figure out why rlimit is broken.
-// #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(target_os = "linux")]
 fn test_round_robin_limited_file_descriptors() {
     new_ucmd!()
@@ -2093,16 +2175,70 @@ fn test_split_non_utf8_additional_suffix_is_byte_preserving() {
 }
 
 #[test]
+fn test_empty_input_does_not_create_output() {
+    for args in [&[][..], &["-b", "1"], &["-l", "1"], &["-C", "1"]] {
+        let scenario = TestScenario::new(util_name!());
+        let at = &scenario.fixtures;
+
+        scenario
+            .ucmd()
+            .args(args)
+            .arg("--verbose")
+            .pipe_in("")
+            .succeeds()
+            .no_output();
+        assert!(!at.plus("xaa").exists());
+
+        at.touch("empty");
+        scenario
+            .ucmd()
+            .args(args)
+            .arg("empty")
+            .succeeds()
+            .no_output();
+        assert!(!at.plus("xaa").exists());
+    }
+}
+
+#[test]
+fn test_empty_input_preserves_existing_output() {
+    for args in [&[][..], &["-b", "1"], &["-l", "1"], &["-C", "1"]] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.write("xaa", "keep this output\n");
+
+        ucmd.args(args).pipe_in("").succeeds().no_output();
+        assert_eq!(at.read("xaa"), "keep this output\n");
+        assert!(!at.plus("xab").exists());
+    }
+}
+
+#[test]
+fn test_empty_input_with_output_directory() {
+    for args in [&[][..], &["-b", "1"], &["-l", "1"], &["-C", "1"]] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.mkdir("xaa");
+
+        ucmd.args(args).pipe_in("").succeeds().no_output();
+        assert!(at.plus("xaa").is_dir());
+        assert!(!at.plus("xab").exists());
+    }
+}
+
+#[test]
 #[cfg(unix)] // To re-enable on Windows once I work out what goes wrong with it.
 fn test_split_directory_already_exists() {
-    let (at, mut ucmd) = at_and_ucmd!();
+    for args in [&[][..], &["-b", "1"], &["-l", "1"], &["-C", "1"]] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.mkdir("xaa");
 
-    at.mkdir("xaa"); // For collision with.
-    at.touch("file");
-    ucmd.args(&["file"])
-        .fails_with_code(1)
-        .no_stdout()
-        .stderr_is("split: 'xaa': Is a directory\n");
+        ucmd.args(args)
+            .pipe_in("data\n")
+            .fails_with_code(1)
+            .no_stdout()
+            .stderr_is("split: 'xaa': Is a directory\n");
+        assert!(at.plus("xaa").is_dir());
+        assert!(!at.plus("xab").exists());
+    }
 }
 
 #[test]
@@ -2128,14 +2264,18 @@ fn test_write_error_on_full_device() {
 
     // The first chunk lands on /dev/full, so its write can never succeed.
     at.symlink_file("/dev/full", "xaa");
-    at.write("input", "uv");
-
-    ucmd.args(&["-b", "1", "input"])
+    ucmd.args(&["-b", "1"])
+        .pipe_in("uv")
         .fails_with_code(1)
         .no_stdout()
-        .stderr_contains("split: xaa: No space left on device");
+        .stderr_is("split: xaa: No space left on device\n");
 
     // split must not have moved on to the next chunk.
+    assert!(at.plus("xaa").is_symlink());
+    assert_eq!(
+        fs::read_link(at.plus("xaa")).unwrap(),
+        Path::new("/dev/full")
+    );
     assert!(!at.file_exists("xab"));
 }
 
@@ -2202,4 +2342,14 @@ split: invalid number of bytes: '7zq'
             .fails_with_code(1)
             .stderr_is("split: invalid number of bytes: '7zq'\n");
     }
+}
+
+#[test]
+fn test_obsolete_lines_not_read_after_double_dash() {
+    // After `--` there are no more options, so `-1` names a file rather than
+    // being taken as the obsolete `split -1` line-count spelling.
+    new_ucmd!()
+        .args(&["--", "-1"])
+        .fails()
+        .stderr_contains("cannot open '-1' for reading");
 }

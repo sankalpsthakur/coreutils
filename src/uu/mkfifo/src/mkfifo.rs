@@ -4,8 +4,7 @@
 // file that was distributed with this source code.
 
 use clap::{Arg, ArgAction, Command, value_parser};
-use rustix::fs::Mode;
-use rustix::process::umask;
+use rustix::fs::RawMode;
 use std::ffi::OsString;
 use uucore::display::Quotable;
 use uucore::error::{ExitCode, UResult, USimpleError, strip_errno};
@@ -81,9 +80,8 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         // that used to follow this call closes the TOCTOU window an
         // attacker could use to swap the FIFO for a symlink between
         // mkfifo and chmod (issue #10020).
-        let prev_umask = umask(Mode::empty());
-        let mkfifo_result = create_fifo(f.as_str(), mode);
-        umask(prev_umask);
+        let mkfifo_result =
+            uucore::mode::with_umask(0, || create_fifo(f.as_str(), mode as RawMode));
 
         if let Err(e) = mkfifo_result {
             show!(USimpleError::new(
@@ -154,13 +152,13 @@ pub fn uu_app() -> Command {
 // libc's path-based `mkfifo` there. Both rely on the caller having cleared
 // the umask so the requested mode is applied atomically (see issue #10020).
 #[cfg(not(target_vendor = "apple"))]
-fn create_fifo(path: &str, mode: u32) -> std::io::Result<()> {
+fn create_fifo(path: &str, mode: RawMode) -> std::io::Result<()> {
     use rustix::fs;
-    fs::mkfifoat(fs::CWD, path, Mode::from_bits_truncate(mode)).map_err(Into::into)
+    fs::mkfifoat(fs::CWD, path, fs::Mode::from_bits_truncate(mode)).map_err(Into::into)
 }
 
 #[cfg(target_vendor = "apple")]
-fn create_fifo(path: &str, mode: u32) -> std::io::Result<()> {
+fn create_fifo(path: &str, mode: RawMode) -> std::io::Result<()> {
     use std::ffi::CString;
     let c_path =
         CString::new(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;

@@ -2,9 +2,12 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
+// spell-checker:ignore (ToDO) taaaa tbbbb tcccc
+
+use rstest::rstest;
 use uucore::display::Quotable;
 use uutests::new_ucmd;
-// spell-checker:ignore (ToDO) taaaa tbbbb tcccc
 
 #[test]
 fn test_invalid_arg() {
@@ -66,75 +69,31 @@ fn test_with_multiple_files() {
 }
 
 #[test]
-fn test_tabs_space_separated_list() {
-    new_ucmd!()
-        .args(&["--tabs", "3 6 9"])
-        .pipe_in("a\tb\tc\td\te")
-        .succeeds()
-        .stdout_is("a  b  c  d e");
+fn test_tabs() {
+    for list in ["3 6 9", "3,6,9", "3\t6\t9", ", \t3,\t6 9,"] {
+        new_ucmd!()
+            .arg("--tabs")
+            .arg(list)
+            .pipe_in("a\tb\tc\td\te")
+            .succeeds()
+            .stdout_is("a  b  c  d e");
+    }
 }
 
-#[test]
-fn test_tabs_mixed_style_list() {
+#[rstest]
+#[case::multiple_tabs_args(&["--tabs=3", "--tabs=6", "--tabs=9"], "a\tb\tc\td\te", "a  b  c  d e")]
+#[case::tabs_empty_string(&["--tabs", ""], "a\tb\tc", "a       b       c")]
+#[case::tabs_comma_only(&["--tabs", ","], "a\tb\tc", "a       b       c")]
+#[case::tabs_space_only(&["--tabs", " "], "a\tb\tc", "a       b       c")]
+#[case::tabs_slash(&["--tabs", "/"], "a\tb\tc", "a       b       c")]
+#[case::tabs_plus(&["--tabs", "+"], "a\tb\tc", "a       b       c")]
+#[case::tabs_comma_separated_no_numbers(&["--tabs=+,/,+,/"], "\ta\tb\tc", "        a       b       c")]
+fn test_expand_stdin(#[case] args: &[&str], #[case] input: &str, #[case] expected: &str) {
     new_ucmd!()
-        .args(&["--tabs", ", 3,6 9"])
-        .pipe_in("a\tb\tc\td\te")
+        .args(args)
+        .pipe_in(input)
         .succeeds()
-        .stdout_is("a  b  c  d e");
-}
-
-#[test]
-fn test_multiple_tabs_args() {
-    new_ucmd!()
-        .args(&["--tabs=3", "--tabs=6", "--tabs=9"])
-        .pipe_in("a\tb\tc\td\te")
-        .succeeds()
-        .stdout_is("a  b  c  d e");
-}
-
-#[test]
-fn test_tabs_empty_string() {
-    new_ucmd!()
-        .args(&["--tabs", ""])
-        .pipe_in("a\tb\tc")
-        .succeeds()
-        .stdout_is("a       b       c");
-}
-
-#[test]
-fn test_tabs_comma_only() {
-    new_ucmd!()
-        .args(&["--tabs", ","])
-        .pipe_in("a\tb\tc")
-        .succeeds()
-        .stdout_is("a       b       c");
-}
-
-#[test]
-fn test_tabs_space_only() {
-    new_ucmd!()
-        .args(&["--tabs", " "])
-        .pipe_in("a\tb\tc")
-        .succeeds()
-        .stdout_is("a       b       c");
-}
-
-#[test]
-fn test_tabs_slash() {
-    new_ucmd!()
-        .args(&["--tabs", "/"])
-        .pipe_in("a\tb\tc")
-        .succeeds()
-        .stdout_is("a       b       c");
-}
-
-#[test]
-fn test_tabs_plus() {
-    new_ucmd!()
-        .args(&["--tabs", "+"])
-        .pipe_in("a\tb\tc")
-        .succeeds()
-        .stdout_is("a       b       c");
+        .stdout_only(expected);
 }
 
 #[test]
@@ -190,6 +149,24 @@ fn test_tabs_must_be_ascending() {
 }
 
 #[test]
+fn test_tabs_trailing_size_not_larger_than_last_stop() {
+    // The number after `/` or `+` is a tab size, not a tab stop, so it
+    // does not have to be larger than the previous tab stop.
+    new_ucmd!()
+        .arg("--tabs=2,/2")
+        .pipe_in("a\tb\tc")
+        .succeeds()
+        //          012345
+        .stdout_is("a b c");
+    new_ucmd!()
+        .arg("--tabs=4,+2")
+        .pipe_in("\ta\tb")
+        .succeeds()
+        //          01234567
+        .stdout_is("    a b");
+}
+
+#[test]
 fn test_tabs_cannot_be_zero() {
     new_ucmd!()
         .arg("--tabs=0")
@@ -208,15 +185,6 @@ fn test_tabs_keep_last_trailing_specifier() {
         //          0         1
         //          01234567890
         .stdout_is(" a   b    c");
-}
-
-#[test]
-fn test_tabs_comma_separated_no_numbers() {
-    new_ucmd!()
-        .arg("--tabs=+,/,+,/")
-        .pipe_in("\ta\tb\tc")
-        .succeeds()
-        .stdout_is("        a       b       c");
 }
 
 #[test]

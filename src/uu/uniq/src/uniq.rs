@@ -2,7 +2,9 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore badoption CTYPE
+
 use clap::{
     Arg, ArgAction, ArgMatches, Command, builder::ValueParser, error::ContextKind, error::Error,
     error::ErrorKind,
@@ -82,7 +84,11 @@ impl Uniq {
         let mut next_meta = LineMeta::default();
         let mut line_out = Vec::with_capacity(1024);
 
-        while Self::read_line(&mut reader, &mut next_buf, line_terminator)? {
+        let read_result = loop {
+            match Self::read_line(&mut reader, &mut next_buf, line_terminator) {
+                Ok(true) => {}
+                result => break result.map(|_| ()),
+            }
             self.build_meta(&next_buf, &mut next_meta);
 
             if self.keys_are_equal(&current_buf, &current_meta, &next_buf, &next_meta) {
@@ -117,9 +123,14 @@ impl Uniq {
                 group_count = 1;
             }
             next_buf.clear();
-        }
+        };
 
-        if (group_count == 1 && !self.repeats_only) || (group_count > 1 && !self.uniques_only) {
+        // Counts and filtering require the group to end; a read error does not end it.
+        let can_write_pending_line =
+            read_result.is_ok() || !(self.show_counts || self.repeats_only || self.uniques_only);
+        let group_matches_filter =
+            (group_count == 1 && !self.repeats_only) || (group_count > 1 && !self.uniques_only);
+        if can_write_pending_line && group_matches_filter {
             self.write_line(
                 writer,
                 &mut line_out,
@@ -139,7 +150,7 @@ impl Uniq {
         writer
             .flush()
             .map_err_context(|| translate!("uniq-error-write-error"))?;
-        Ok(())
+        read_result
     }
 
     fn get_line_terminator(&self) -> u8 {
@@ -375,6 +386,7 @@ fn handle_obsolete(args: impl uucore::Args) -> (Vec<OsString>, Option<usize>, Op
     let mut skip_chars_old = None;
     let mut preceding_long_opt_req_value = false;
     let mut preceding_short_opt_req_value = false;
+    let mut after_double_dash = false;
 
     let filtered_args = args
         .filter_map(|os_slice| {
@@ -384,6 +396,7 @@ fn handle_obsolete(args: impl uucore::Args) -> (Vec<OsString>, Option<usize>, Op
                 &mut skip_chars_old,
                 &mut preceding_long_opt_req_value,
                 &mut preceding_short_opt_req_value,
+                &mut after_double_dash,
             )
         })
         .collect();
@@ -403,9 +416,19 @@ fn filter_args(
     skip_chars_old: &mut Option<String>,
     preceding_long_opt_req_value: &mut bool,
     preceding_short_opt_req_value: &mut bool,
+    after_double_dash: &mut bool,
 ) -> Option<OsString> {
     let filter: Option<OsString>;
     if let Some(slice) = os_slice.to_str() {
+        if *after_double_dash {
+            // Past `--` everything is an operand, so `uniq -- -1` names a file
+            // rather than skipping a field.
+            return Some(OsString::from(slice));
+        }
+        if slice == "--" {
+            *after_double_dash = true;
+            return Some(OsString::from(slice));
+        }
         if should_extract_obs_skip_fields(
             slice,
             *preceding_long_opt_req_value,
@@ -616,6 +639,8 @@ fn handle_extract_obs_skip_chars(
 /// Unfortunately these overrides are necessary, since several GNU tests
 /// for `uniq` hardcode and require the exact wording of the error message
 /// and it is not compatible with how Clap formats and displays those error messages.
+#[cold]
+#[inline(never)]
 fn map_clap_errors(clap_error: Error) -> Box<dyn UError> {
     let footer = translate!("uniq-error-try-help");
     let override_arg_conflict = translate!("uniq-error-group-mutually-exclusive") + "\n" + &footer;
@@ -712,6 +737,8 @@ pub fn uu_app() -> Command {
         .about(translate!("uniq-about"))
         .override_usage(format_usage(&translate!("uniq-usage")))
         .infer_long_args(true)
+        // GNU lets a later -f/-s/-w override an earlier one.
+        .args_override_self(true)
         .after_help(translate!("uniq-after-help"));
     uucore::clap_localization::configure_localized_command(cmd)
         .arg(
@@ -835,9 +862,7 @@ fn get_delimiter(matches: &ArgMatches) -> Delimiters {
 fn open_input_file(in_file_name: Option<&OsStr>) -> UResult<Box<dyn BufRead>> {
     Ok(match in_file_name {
         Some(path) if path != "-" => {
-            let in_file = File::open(path).map_err_context(
-                || translate!("uniq-error-could-not-open", "path" => path.maybe_quote()),
-            )?;
+            let in_file = File::open(path).map_err_context(|| path.maybe_quote().to_string())?;
             Box::new(BufReader::with_capacity(OUTPUT_BUFFER_CAPACITY, in_file))
         }
         _ => Box::new(stdin().lock()),
@@ -848,9 +873,7 @@ fn open_input_file(in_file_name: Option<&OsStr>) -> UResult<Box<dyn BufRead>> {
 fn open_output_file(out_file_name: Option<&OsStr>) -> UResult<Box<dyn Write>> {
     Ok(match out_file_name {
         Some(path) if path != "-" => {
-            let out_file = File::create(path).map_err_context(
-                || translate!("uniq-error-could-not-open", "path" => path.maybe_quote()),
-            )?;
+            let out_file = File::create(path).map_err_context(|| path.maybe_quote().to_string())?;
             Box::new(BufWriter::with_capacity(OUTPUT_BUFFER_CAPACITY, out_file))
         }
         _ => Box::new(BufWriter::with_capacity(

@@ -2,8 +2,10 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+
 // spell-checker:ignore roff
 // spell-checker:ignore funnnnnnnnnnnnnnnnn
+
 use uutests::new_ucmd;
 
 #[test]
@@ -318,6 +320,88 @@ fn test_gnu_mode_dumb_format() {
 }
 
 #[test]
+fn test_gnu_mode_context_spans_newlines_without_sentence_regexp() {
+    new_ucmd!()
+        .pipe_in("one two\nthree four\n")
+        .succeeds()
+        .stdout_only(concat!(
+            "                       one two three   four\n",
+            "                                       one two three four\n",
+            "                             one two   three four\n",
+            "                                 one   two three four\n",
+        ));
+}
+
+#[test]
+fn test_gnu_mode_sentence_break_at_line_end() {
+    new_ucmd!()
+        .pipe_in("Hello world.\nFoo bar\n")
+        .succeeds()
+        .stdout_only(concat!(
+            "                                       Foo bar\n",
+            "                                       Hello world.\n",
+            "                                 Foo   bar\n",
+            "                               Hello   world.\n",
+        ));
+}
+
+#[test]
+fn test_traditional_mode_is_line_based_without_sentence_regexp() {
+    new_ucmd!()
+        .args(&["-G"])
+        .pipe_in("one two\nthree four\n")
+        .succeeds()
+        .stdout_only(concat!(
+            r#".xx "" "three" "four" """#,
+            "\n",
+            r#".xx "" "" "one two" """#,
+            "\n",
+            r#".xx "" "" "three four" """#,
+            "\n",
+            r#".xx "" "one" "two" """#,
+            "\n",
+        ));
+}
+
+#[test]
+fn test_sentence_regexp_preserves_matched_terminator() {
+    new_ucmd!()
+        .args(&["-S", r"\.  "])
+        .pipe_in("Hello world.  Foo bar\n")
+        .succeeds()
+        .stdout_only(concat!(
+            "                                       Foo bar\n",
+            "                                       Hello world.\n",
+            "                                 Foo   bar\n",
+            "                               Hello   world.\n",
+        ));
+}
+
+#[test]
+fn test_sentence_regexp_no_spurious_truncation_at_eof() {
+    new_ucmd!()
+        .args(&["-S", r"\.  "])
+        .pipe_in("Hello world.  Foo bar\n")
+        .succeeds()
+        .stdout_does_not_contain("/")
+        .stdout_contains("Foo bar\n");
+}
+
+#[test]
+fn test_gnu_mode_auto_ref_uses_physical_line_numbers() {
+    new_ucmd!()
+        .args(&["-A"])
+        .pipe_in("one two\nthree four\n")
+        .succeeds()
+        .stdout_only(concat!(
+            ":2                       one two three   four\n",
+            ":1                                       one two three four\n",
+            ":2                             one two   three four\n",
+            ":1                                 one   two three four\n",
+        ));
+}
+
+#[test]
 fn test_gnu_compatibility_narrow_width() {
     new_ucmd!()
         .args(&["-w", "2"])
@@ -339,7 +423,7 @@ fn test_gnu_compatibility_truncation_width() {
 fn test_unicode_padding_alignment() {
     let input = "a\né";
     new_ucmd!()
-        .args(&["-w", "10"])
+        .args(&["-w", "10", "-S", "\n"])
         .pipe_in(input)
         .succeeds()
         .stdout_only("        a\n        é\n");
@@ -484,4 +568,17 @@ fn test_invalid_utf8_input_is_not_an_error() {
         .pipe_in(b"ab\xFFcd\n".to_vec())
         .succeeds()
         .no_stderr();
+}
+
+#[test]
+fn test_nullable_word_regexp_no_empty_matches() {
+    let expected = concat!(
+        "                                       aa bb cc\n",
+        "                                  aa   bb cc\n"
+    );
+    new_ucmd!()
+        .args(&["-W", "[ab]{0,}"])
+        .pipe_in("aa bb cc\n")
+        .succeeds()
+        .stdout_only(expected);
 }
