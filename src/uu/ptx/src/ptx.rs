@@ -199,6 +199,8 @@ struct WordRef {
     position: usize,
     position_end: usize,
     char_start: usize,
+    /// 0-based physical input line of this keyword, used for `-A`.
+    ref_line_nr: usize,
 }
 
 fn get_config(matches: &mut clap::ArgMatches) -> UResult<Config> {
@@ -273,17 +275,25 @@ fn get_config(matches: &mut clap::ArgMatches) -> UResult<Config> {
 struct FileContent {
     lines: Vec<String>,
     chars_lines: Vec<Vec<char>>,
+    line_info: Vec<LineInfo>,
 }
+
+/// Maps a sentence back to physical input lines after newlines were folded to spaces.
+struct LineInfo {
+    start_line: usize,
+    newline_offsets: Vec<usize>,
+}
+
+/// GNU-mode default: `.?!`, optional closers, then EOL / tab / two spaces, then trailing whitespace.
+/// `(?m)` makes `$` match at line ends.
+const DEFAULT_GNU_SENTENCE_REGEX: &str = r#"(?m)[.?!][]"'`}]*($|\t|  )[ \t\n]*"#;
 
 type FileMap = Vec<(OsString, FileContent)>;
 
 fn read_input(input_files: &[OsString], config: &Config) -> UResult<FileMap> {
     let mut file_map: FileMap = FileMap::new();
 
-    let sentence_splitter = config
-        .sentence_regex
-        .as_ref()
-        .and_then(|re_str| Regex::new(re_str).ok());
+    let sentence_re = compile_sentence_regex(config);
 
     for filename in input_files {
         let mut reader: BufReader<Box<dyn Read>> = BufReader::new(if filename == "-" {
@@ -296,21 +306,38 @@ fn read_input(input_files: &[OsString], config: &Config) -> UResult<FileMap> {
         });
 
         // Attach the quoted filename context if reading the contents fails
-        let lines = read_lines(sentence_splitter.as_ref(), &mut reader)
+        let (lines, line_info) = read_lines(sentence_re.as_ref(), &mut reader)
             .map_err_context(|| filename.quote().to_string())?;
 
         // Indexing UTF-8 string requires walking from the beginning, which can hurts performance badly when the line is long.
         // Since we will be jumping around the line a lot, we dump the content into a Vec<char>, which can be indexed in constant time.
         let chars_lines: Vec<Vec<char>> = lines.iter().map(|x| x.chars().collect()).collect();
-        file_map.push((filename.clone(), FileContent { lines, chars_lines }));
+        file_map.push((
+            filename.clone(),
+            FileContent {
+                lines,
+                chars_lines,
+                line_info,
+            },
+        ));
     }
     Ok(file_map)
+}
+
+fn compile_sentence_regex(config: &Config) -> Option<Regex> {
+    if let Some(re_str) = config.sentence_regex.as_deref() {
+        Regex::new(re_str).ok()
+    } else if config.gnu_ext {
+        Some(Regex::new(DEFAULT_GNU_SENTENCE_REGEX).expect("default GNU sentence regexp is valid"))
+    } else {
+        None
+    }
 }
 
 fn read_lines(
     sentence_splitter: Option<&Regex>,
     reader: &mut dyn BufRead,
-) -> std::io::Result<Vec<String>> {
+) -> std::io::Result<(Vec<String>, Vec<LineInfo>)> {
     // GNU ptx works on bytes, so invalid UTF-8 input must not be an error.
     // Read everything and replace invalid sequences instead of failing.
     let mut bytes = Vec::new();
@@ -318,14 +345,83 @@ fn read_lines(
     let buffer = String::from_utf8_lossy(&bytes);
 
     if let Some(re) = sentence_splitter {
-        Ok(re
-            .split(&buffer)
-            .map(|s| s.replace('\n', " ")) // ptx behavior: newlines become spaces inside sentences
-            .filter(|s| !s.is_empty()) // remove empty sentences
-            .collect())
+        Ok(split_sentences(&buffer, re))
     } else {
-        Ok(buffer.lines().map(ToOwned::to_owned).collect())
+        let lines: Vec<String> = buffer.lines().map(ToOwned::to_owned).collect();
+        let line_info = (0..lines.len())
+            .map(|i| LineInfo {
+                start_line: i,
+                newline_offsets: Vec::new(),
+            })
+            .collect();
+        Ok((lines, line_info))
     }
+}
+
+/// Split `buffer` on `re`, keeping each match with the preceding sentence.
+/// Newlines (and CRs) become spaces so context can span physical lines.
+fn split_sentences(buffer: &str, re: &Regex) -> (Vec<String>, Vec<LineInfo>) {
+    let mut sentences = Vec::new();
+    let mut line_info = Vec::new();
+    let mut last = 0;
+    let mut start_line = 0;
+
+    for mat in re.find_iter(buffer) {
+        let end = mat.end();
+        if end > last {
+            push_sentence(
+                &buffer[last..end],
+                start_line,
+                &mut sentences,
+                &mut line_info,
+            );
+        }
+        start_line += count_newlines(&buffer[last..end]);
+        last = end;
+    }
+    if last < buffer.len() {
+        push_sentence(&buffer[last..], start_line, &mut sentences, &mut line_info);
+    }
+    (sentences, line_info)
+}
+
+fn count_newlines(s: &str) -> usize {
+    s.bytes().filter(|&b| b == b'\n').count()
+}
+
+fn push_sentence(
+    slice: &str,
+    start_line: usize,
+    sentences: &mut Vec<String>,
+    line_info: &mut Vec<LineInfo>,
+) {
+    let mut text = String::with_capacity(slice.len());
+    let mut newline_offsets = Vec::new();
+    for c in slice.chars() {
+        match c {
+            '\n' => {
+                newline_offsets.push(text.len());
+                text.push(' ');
+            }
+            '\r' => text.push(' '),
+            _ => text.push(c),
+        }
+    }
+    let trimmed_len = text.trim_end().len();
+    if trimmed_len == 0 {
+        return;
+    }
+    text.truncate(trimmed_len);
+    newline_offsets.retain(|&off| off < trimmed_len);
+    sentences.push(text);
+    line_info.push(LineInfo {
+        start_line,
+        newline_offsets,
+    });
+}
+
+fn orig_line_number(info: &LineInfo, byte_pos: usize) -> usize {
+    info.start_line + info.newline_offsets.partition_point(|&off| off <= byte_pos)
 }
 
 /// Go through every lines in the input files and record each match occurrence as a `WordRef`.
@@ -338,9 +434,9 @@ fn create_word_set(config: &Config, filter: &WordFilter, file_map: &FileMap) -> 
     };
 
     let mut word_set: BTreeSet<WordRef> = BTreeSet::new();
-    for (file_index, (_, lines)) in file_map.iter().enumerate() {
-        let mut count: usize = 0;
-        for line in &lines.lines {
+    for (file_index, (_, content)) in file_map.iter().enumerate() {
+        for (count, line) in content.lines.iter().enumerate() {
+            let info = &content.line_info[count];
             // if -r, exclude reference from word set
             let (ref_beg, ref_end) = match ref_reg.find(line) {
                 Some(x) => (x.start(), x.end()),
@@ -390,9 +486,9 @@ fn create_word_set(config: &Config, filter: &WordFilter, file_map: &FileMap) -> 
                     position: beg,
                     position_end: end,
                     char_start,
+                    ref_line_nr: orig_line_number(info, beg),
                 });
             }
-            count += 1;
         }
     }
     word_set
@@ -407,9 +503,9 @@ fn get_reference(
 ) -> String {
     if config.auto_ref {
         if filename == "-" {
-            format!(":{}", word_ref.local_line_nr + 1)
+            format!(":{}", word_ref.ref_line_nr + 1)
         } else {
-            format!("{}:{}", filename.maybe_quote(), word_ref.local_line_nr + 1)
+            format!("{}:{}", filename.maybe_quote(), word_ref.ref_line_nr + 1)
         }
     } else if config.input_ref {
         let (beg, end) = match context_reg.find(line) {
@@ -815,7 +911,9 @@ fn write_traditional_output(
 
     for word_ref in words {
         let (filename, file_map_value) = &file_map[word_ref.file_index];
-        let FileContent { lines, chars_lines } = file_map_value;
+        let FileContent {
+            lines, chars_lines, ..
+        } = file_map_value;
         let reference = get_reference(
             config,
             word_ref,
@@ -862,11 +960,8 @@ fn get_auto_max_reference_len(words: &BTreeSet<WordRef>, file_map: &FileMap) -> 
     let line_num = words
         .iter()
         .map(|w| {
-            if w.local_line_nr == 0 {
-                1
-            } else {
-                (w.local_line_nr as f64).log10() as usize + 1
-            }
+            let n = w.ref_line_nr + 1;
+            n.checked_ilog10().unwrap_or(0) as usize + 1
         })
         .max()
         .unwrap_or(0);
