@@ -394,10 +394,10 @@ fn test_gnu_mode_auto_ref_uses_physical_line_numbers() {
         .pipe_in("one two\nthree four\n")
         .succeeds()
         .stdout_only(concat!(
-            ":2:                   one two three   four\n",
-            ":1:                                   one two three four\n",
-            ":2:                         one two   three four\n",
-            ":1:                             one   two three four\n",
+            ":2                       one two three   four\n",
+            ":1                                       one two three four\n",
+            ":2                             one two   three four\n",
+            ":1                                 one   two three four\n",
         ));
 }
 
